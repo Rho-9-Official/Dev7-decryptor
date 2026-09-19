@@ -27,6 +27,9 @@ WHAT THIS TOOL DOES
     3. If none fit, generates candidates modelled on how these specific
        operators actually type keys, then sweeps them.
     4. Verifies every recovery against the real structure of the file.
+    5. Repeats the whole search on anything still unaccounted for, because a
+       machine whose encryption run was interrupted and restarted carries
+       more than one key.
 
 THIS TOOL ONLY DECRYPTS
 
@@ -99,8 +102,77 @@ import string
 import sys
 import time
 
-VERSION = "3.0"
+VERSION = "3.2"
 EXT = ".cryptedmicro"
+
+WINDOWS = os.name == "nt"
+
+
+# ===========================================================================
+# SECTION 0. Windows runtime.
+#
+# Three Windows behaviours will each kill a recovery mid run, so they are
+# dealt with before anything else happens.
+#
+#   1. Console encoding. The recovered keys carry Turkish characters. When
+#      output is piped or redirected Windows falls back to the ANSI code page
+#      and print() raises UnicodeEncodeError, so
+#      "unmicro.exe --list-keys > keys.txt" would die instead of writing the
+#      keys. Same for any recovered filename that is not plain ASCII.
+#
+#   2. MAX_PATH. This family appends ".cryptedmicro" to the original absolute
+#      path, adding 13 characters to paths that were frequently deep already,
+#      and the output root adds more on top. Past 260 characters the plain
+#      Win32 calls fail, so every path this tool opens, creates or tests is
+#      handed over in extended length form.
+#
+#   3. Frozen multiprocessing. In a PyInstaller build the worker processes
+#      re-execute the bundle, so without freeze_support() --workers relaunches
+#      the whole program instead of starting workers. See the bottom of this
+#      file.
+#
+# All three helpers are no-ops off Windows, so there is one code path.
+# ===========================================================================
+
+def setup_console():
+    """Make stdout and stderr survive non-ASCII, redirected or not."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def long_path(path):
+    r"""
+    Hand a path to Win32 in extended length form so it is not capped at
+    MAX_PATH. Returns the path untouched off Windows, and untouched if it is
+    already in that form. UNC shares take the \\?\UNC\ variant.
+
+    Use this for opening, creating and existence testing only. Never for
+    anything shown to the person, because the prefix is noise to them.
+    """
+    if not WINDOWS or not path:
+        return path
+    try:
+        p = os.path.abspath(path)
+    except (OSError, ValueError):
+        return path
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def plain_path(path):
+    """Strip the extended length prefix again, for display and for output."""
+    if WINDOWS and path:
+        if path.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + path[8:]
+        if path.startswith("\\\\?\\"):
+            return path[4:]
+    return path
 
 # ===========================================================================
 # SECTION 1. Known keys, recovered from the operators' Discord C2.
@@ -639,7 +711,7 @@ def decrypt_file(path, key_string, verify=True):
     ever read.
     """
     try:
-        with open(path, "rb") as fh:
+        with open(long_path(path), "rb") as fh:
             ct = fh.read()
     except OSError as e:
         return None, False, "cannot read: %s" % e
@@ -690,9 +762,21 @@ def candidate_roots():
         try:
             import ctypes
             mask = ctypes.windll.kernel32.GetLogicalDrives()
+            get_type = ctypes.windll.kernel32.GetDriveTypeW
             for i, letter in enumerate(string.ascii_uppercase):
-                if mask & (1 << i):
-                    roots.append(letter + ":\\")
+                if not (mask & (1 << i)):
+                    continue
+                root = letter + ":\\"
+                # DRIVE_NO_ROOT_DIR is a letter with nothing mounted and
+                # DRIVE_CDROM is optical media. Walking either stalls --auto
+                # on a machine the person is already anxious about, and
+                # neither is going to be holding their encrypted files.
+                try:
+                    if get_type(root) in (1, 5):
+                        continue
+                except Exception:
+                    pass
+                roots.append(root)
         except Exception:
             roots = [l + ":\\" for l in string.ascii_uppercase
                      if os.path.exists(l + ":\\")]
@@ -719,23 +803,36 @@ def walk_for_encrypted(roots, prune=True, progress=True, limit=None):
     seen_dirs = 0
     t0 = time.time()
     for root in roots:
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True,
-                                                    onerror=lambda e: None,
-                                                    followlinks=False):
-            seen_dirs += 1
-            if prune:
-                dirnames[:] = [d for d in dirnames if d.lower() not in PRUNE_DIRS]
-            for name in filenames:
-                if name.endswith(EXT):
-                    found.append(os.path.join(dirpath, name))
-                    if limit and len(found) >= limit:
-                        if progress:
-                            sys.stderr.write(" " * 72 + "\r")
-                        return sorted(found)
-            if progress and seen_dirs % 400 == 0:
-                sys.stderr.write("  scanning... %d folders, %d encrypted files, %.0fs\r"
-                                 % (seen_dirs, len(found), time.time() - t0))
-                sys.stderr.flush()
+        # On Windows the root goes in as an extended length path so the walk
+        # can reach trees deeper than MAX_PATH, which is exactly where this
+        # family's 13 extra characters push things. If that form yields
+        # nothing at all, meaning it was rejected rather than the tree being
+        # empty, the plain root is retried so a whole drive is never skipped
+        # in silence.
+        for attempt in ([long_path(root), root] if WINDOWS else [root]):
+            walked = 0
+            for dirpath, dirnames, filenames in os.walk(attempt, topdown=True,
+                                                        onerror=lambda e: None,
+                                                        followlinks=False):
+                walked += 1
+                seen_dirs += 1
+                if prune:
+                    dirnames[:] = [d for d in dirnames
+                                   if d.lower() not in PRUNE_DIRS]
+                for name in filenames:
+                    if name.endswith(EXT):
+                        found.append(plain_path(os.path.join(dirpath, name)))
+                        if limit and len(found) >= limit:
+                            if progress:
+                                sys.stderr.write(" " * 72 + "\r")
+                            return sorted(found)
+                if progress and seen_dirs % 400 == 0:
+                    sys.stderr.write(
+                        "  scanning... %d folders, %d encrypted files, %.0fs\r"
+                        % (seen_dirs, len(found), time.time() - t0))
+                    sys.stderr.flush()
+            if walked or attempt == root:
+                break
     if progress:
         sys.stderr.write(" " * 72 + "\r")
         sys.stderr.flush()
@@ -747,10 +844,13 @@ def collect(root, recursive):
     if os.path.isfile(root):
         return [os.path.abspath(root)] if root.endswith(EXT) else []
     out = []
-    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+    walk_root = long_path(root) if WINDOWS else root
+    for dirpath, dirnames, filenames in os.walk(walk_root,
+                                                onerror=lambda e: None):
         for name in filenames:
             if name.endswith(EXT):
-                out.append(os.path.abspath(os.path.join(dirpath, name)))
+                out.append(plain_path(
+                    os.path.abspath(os.path.join(dirpath, name))))
         if not recursive:
             dirnames[:] = []
     return sorted(out)
@@ -1189,7 +1289,7 @@ def probe_set(files, max_probes=4):
     groups = {}
     for p in files:
         try:
-            with open(p, "rb") as fh:
+            with open(long_path(p), "rb") as fh:
                 b = fh.read(16)
         except OSError:
             continue
@@ -1326,7 +1426,7 @@ def map_keys_to_files(files, keys):
         hits = []
         for p in files:
             try:
-                with open(p, "rb") as fh:
+                with open(long_path(p), "rb") as fh:
                     blk = fh.read(16)
             except OSError:
                 continue
@@ -1351,7 +1451,7 @@ def map_keys_to_files(files, keys):
             if p in covered:
                 continue
             try:
-                with open(p, "rb") as fh:
+                with open(long_path(p), "rb") as fh:
                     ct = fh.read()
             except OSError:
                 continue
@@ -1363,6 +1463,71 @@ def map_keys_to_files(files, keys):
             mapping[k].append(p)
             covered.add(p)
     return mapping
+
+
+def find_all_keys(files, plan, workers=1, limit=None, quiet=False,
+                  max_passes=8):
+    """
+    Sweep until every file is accounted for, or until a round turns up
+    nothing new. Returns (mapping, candidates tried, files still unmatched).
+
+    A machine does not reliably carry one key. If the victim reboots part way
+    through, or kills the process, or the box goes down on its own, the
+    operators simply run it again, and the second run is typed with a new key.
+    Files encrypted before the interruption and files encrypted after it then
+    sit in the same folders under different keys.
+
+    sweep() works from at most four probe blocks, chosen by how many files
+    share them, so one pass finds whichever key covers the bulk of the set and
+    stops there. Each round below re-sweeps only what is still unmatched,
+    which moves the probes onto the leftovers and brings out the next key.
+
+    The tiers are re-run in their original order every round, so the cheap
+    recovered-key tier gets first look at the leftovers before anything
+    expensive starts. In the interrupted-run case that is usually where both
+    keys are found, and the extra round costs a few thousand AES blocks.
+    """
+    mapping = {}
+    remaining = list(files)
+    tried_total = 0
+    passes = 0
+    while remaining and passes < max_passes:
+        passes += 1
+        if limit is not None:
+            budget = limit - tried_total
+            if budget <= 0:
+                break
+        else:
+            budget = None
+
+        if mapping and not quiet:
+            print("  %d file(s) not covered yet, sweeping those on their own:"
+                  % len(remaining))
+
+        found, tried = sweep(remaining, plan, workers=workers, limit=budget,
+                             quiet=quiet)
+        tried_total += tried
+
+        fresh = [k for k in found if k not in mapping]
+        if not fresh:
+            break
+
+        part = map_keys_to_files(remaining, fresh)
+        covered = set()
+        for k, hits in part.items():
+            mapping.setdefault(k, [])
+            for path in hits:
+                if path not in mapping[k]:
+                    mapping[k].append(path)
+            covered.update(hits)
+
+        # A key that was confirmed against a probe but then maps to no file is
+        # a dead end. Stopping here is what keeps this loop finite.
+        if not covered:
+            break
+        remaining = [f for f in remaining if f not in covered]
+
+    return mapping, tried_total, remaining
 
 
 # ===========================================================================
@@ -1389,11 +1554,11 @@ def mirrored_path(out_root, src_path, flat=False):
 
 
 def unique_path(path):
-    if not os.path.exists(path):
+    if not os.path.exists(long_path(path)):
         return path
     stem, ext = os.path.splitext(path)
     i = 1
-    while os.path.exists("%s (%d)%s" % (stem, i, ext)):
+    while os.path.exists(long_path("%s (%d)%s" % (stem, i, ext))):
         i += 1
     return "%s (%d)%s" % (stem, i, ext)
 
@@ -1434,6 +1599,12 @@ def main(argv=None):
                        help="with --brute, widen every generator. Hours, not seconds")
     g_key.add_argument("--workers", type=int, default=1,
                        help="parallel processes for the sweep")
+    g_key.add_argument("--max-passes", type=int, default=8,
+                       help="how many times to sweep for keys. One pass can "
+                            "turn up several keys; each extra pass targets "
+                            "only the files no key covers yet, which is how "
+                            "an interrupted encryption run is picked up "
+                            "(default 8, 1 disables the extra passes)")
     g_key.add_argument("--max-candidates", type=int,
                        help="give up after this many guesses")
     g_key.add_argument("--list-keys", action="store_true",
@@ -1514,7 +1685,8 @@ def main(argv=None):
     # --- work out the key --------------------------------------------------
     wordlist = []
     if args.wordlist:
-        with open(args.wordlist, "r", encoding="utf-8", errors="replace") as fh:
+        with open(long_path(args.wordlist), "r",
+                  encoding="utf-8", errors="replace") as fh:
             wordlist = [ln.rstrip("\r\n") for ln in fh if ln.strip()]
 
     forced = False
@@ -1529,9 +1701,11 @@ def main(argv=None):
                           extra=args.key, wordlist=wordlist)
         if not args.quiet:
             print("Trying keys%s:" % (" (brute force enabled)" if args.brute else ""))
-        found, tried = sweep(files, plan, workers=max(1, args.workers),
-                             limit=args.max_candidates, quiet=args.quiet)
-        if not found:
+        mapping, tried, unmatched = find_all_keys(
+            files, plan, workers=max(1, args.workers),
+            limit=args.max_candidates, quiet=args.quiet,
+            max_passes=max(1, args.max_passes))
+        if not mapping:
             print()
             print("No key opened any file after %d candidate(s)." % tried)
             print()
@@ -1561,9 +1735,18 @@ def main(argv=None):
             return 2
         if not args.quiet:
             print()
-        mapping = map_keys_to_files(files, found)
         for k, hits in mapping.items():
             print("Key found: %r opens %d/%d files" % (k, len(hits), len(files)))
+        if len(mapping) > 1:
+            covered = sum(len(h) for h in mapping.values())
+            print()
+            print("%d keys on this set, covering %d/%d files. That is what an"
+                  % (len(mapping), covered, len(files)))
+            print("interrupted encryption run looks like: the machine went down part")
+            print("way through and the operators started it again under a new key.")
+        if unmatched:
+            print()
+            print("Not covered by any key found: %d file(s)." % len(unmatched))
         print()
 
     if args.identify:
@@ -1576,7 +1759,7 @@ def main(argv=None):
         return 0
 
     # --- decrypt -----------------------------------------------------------
-    os.makedirs(args.dst, exist_ok=True)
+    os.makedirs(long_path(args.dst), exist_ok=True)
     recovered = unverified = failed = 0
     handled = set()
 
@@ -1622,14 +1805,30 @@ def main(argv=None):
                     dest = stem + canon
             if not verified and not forced:
                 dest += ".UNVERIFIED"
-            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-            if not args.overwrite:
-                dest = unique_path(dest)
-
-            tmp = dest + ".part"
-            with open(tmp, "wb") as fh:
-                fh.write(pt)
-            os.replace(tmp, dest)
+            # One destination that cannot be written must not end the run.
+            # On Windows this is usually antivirus holding the handle, a full
+            # disk, or a name the output volume will not take. Say so and move
+            # on, because the other few thousand files still matter.
+            tmp = None
+            try:
+                os.makedirs(long_path(os.path.dirname(dest) or "."),
+                            exist_ok=True)
+                if not args.overwrite:
+                    dest = unique_path(dest)
+                tmp = dest + ".part"
+                with open(long_path(tmp), "wb") as fh:
+                    fh.write(pt)
+                os.replace(long_path(tmp), long_path(dest))
+            except OSError as e:
+                print("  FAIL   %s  (cannot write: %s)"
+                      % (os.path.basename(path), e))
+                failed += 1
+                if tmp:
+                    try:
+                        os.remove(long_path(tmp))
+                    except OSError:
+                        pass
+                continue
 
             if verified:
                 recovered += 1
@@ -1676,6 +1875,16 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # freeze_support must come first and must come before anything touches
+    # multiprocessing. In a PyInstaller build on Windows the worker processes
+    # re-execute this binary, so without it --workers relaunches the whole
+    # program, over and over, instead of starting workers. It is a no-op
+    # everywhere else.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    setup_console()
+
     try:
         sys.exit(main())
     except KeyboardInterrupt:
