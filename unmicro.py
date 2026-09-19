@@ -28,6 +28,13 @@ WHAT THIS TOOL DOES
        operators actually type keys, then sweeps them.
     4. Verifies every recovery against the real structure of the file.
 
+THIS TOOL ONLY DECRYPTS
+
+    There is no encrypt path anywhere in this file. The AES back ends expose
+    decryption only, the built in AES has no encrypt_block, and nothing here
+    can produce a .cryptedmicro file. A recovery tool has no legitimate use
+    for the other direction.
+
 SAFETY RULES BUILT IN
 
     * Your encrypted files are NEVER modified, renamed or deleted. Recovered
@@ -70,21 +77,29 @@ NOTES
     * Key detection works because the first bytes of most file formats are
       fixed. For formats this tool does not recognise, supply the key with
       --key and pass --force.
-    * If nothing is found, that is not the end. This family does not delete
-      Volume Shadow Copies and does not overwrite originals before deleting
-      them, so shadow copies, undelete and file carving are all live options.
-      Do not pay, and do not run the attackers' own !unmicro command, which is
-      their code running on your machine again.
+    * If nothing is found, that is not the end, but do not assume the machine's
+      own recovery paths survived. This crew disables Windows Recovery, Task
+      Manager and Regedit, and adds a Defender exclusion. Check what is
+      actually left rather than counting on it, and get a responder to look.
+    * Do not wipe the machine and do not delete the encrypted files. That is
+      what turns a recoverable situation into a permanent one.
+    * Do not pay. Their "decryption" is issued from their own bot to the
+      implant still sitting on your machine, so it needs the infection kept
+      alive and running, and it is their code executing on your machine a
+      second time. It is not something you can run and not something you
+      should be keeping a live implant around for.
 """
 
 import argparse
+import collections
 import itertools
 import os
+import re
 import string
 import sys
 import time
 
-VERSION = "2.0"
+VERSION = "3.0"
 EXT = ".cryptedmicro"
 
 # ===========================================================================
@@ -148,6 +163,38 @@ OPERATOR_HANDLES = [
     "live",
 ]
 
+# Common Turkish given names and everyday nouns. Coverage of the stem and word
+# families is vocabulary, not structure: a key built on a name that is not in
+# here is unreachable however the candidates are ordered. Adding names is the
+# cheapest way to improve this tool.
+TURKISH_VOCAB = [
+    # given names
+    "ahmet", "mehmet", "mustafa", "ali", "huseyin", "h\u00fcseyin", "hasan",
+    "ibrahim", "\u0130brahim", "osman", "yusuf", "murat", "omer", "\u00f6mer",
+    "ramazan", "kemal", "riza", "r\u0131za", "suleyman", "s\u00fcleyman",
+    "abdullah", "yasar", "ya\u015far", "emre", "burak", "eren", "kerem",
+    "berkay", "tolga", "serkan", "furkan", "batuhan", "mertcan", "sinan",
+    "hakan", "yigit", "yi\u011fit", "alperen", "taylan", "volkan", "emrecan",
+    "caner", "onur", "ozan", "baris", "bar\u0131\u015f", "cem", "deniz",
+    "kaan", "koray", "levent", "melih", "okan", "selim", "tarik", "tar\u0131k",
+    "ugur", "u\u011fur", "umut", "yavuz", "zeynep", "elif", "merve", "busra",
+    "b\u00fc\u015fra", "esra", "fatma", "ayse", "ay\u015fe", "emine", "hatice",
+    "meryem", "seda", "sena", "tugce", "tu\u011f\u00e7e", "yasemin", "ece",
+    # everyday nouns
+    "masa", "kalem", "defter", "kapi", "kap\u0131", "pencere", "duvar",
+    "sandalye", "kedi", "kopek", "k\u00f6pek", "kus", "ku\u015f", "balik",
+    "bal\u0131k", "agac", "a\u011fa\u00e7", "cicek", "\u00e7i\u00e7ek",
+    "bahce", "bah\u00e7e", "sokak", "sehir", "\u015fehir", "koy", "k\u00f6y",
+    "ekmek", "peynir", "kahve", "cay", "\u00e7ay", "su", "sut", "s\u00fct",
+    "elma", "karpuz", "domates", "araba", "otobus", "otob\u00fcs", "tren",
+    "okul", "ogretmen", "\u00f6\u011fretmen", "ogrenci", "\u00f6\u011frenci",
+    "kitap", "telefon", "bilgisayar", "oyun", "futbol", "gunes", "g\u00fcne\u015f",
+    "yildiz", "y\u0131ld\u0131z", "gece", "gunduz", "g\u00fcnd\u00fcz",
+    "sevgi", "ask", "a\u015fk", "dost", "kardes", "karde\u015f", "anne",
+    "baba", "abla", "dede", "nine", "kilit", "anahtar", "kutu", "canta",
+    "\u00e7anta", "ayakkabi", "ayakkab\u0131", "gomlek", "g\u00f6mlek",
+]
+
 # Turkish and English filler seen in or adjacent to operator chatter. One
 # confirmed key is a Turkish insult, so this is a real pattern, not padding.
 TURKISH_SEEDS = [
@@ -158,20 +205,6 @@ TURKISH_SEEDS = [
     "tamam", "evet", "hayir", "hay\u0131r", "bilgisayar", "dosya", "key",
     "pass", "password", "admin", "root", "hack", "hacked", "locked",
     "crypted", "cryptedmicro", "ransom", "money", "btc",
-]
-
-# Prefix plus digits is the single most common observed shape:
-# keyimsel, key3131, key3413, keyu3131.
-KEY_PREFIXES = [
-    "key", "Key", "KEY", "keyu", "KEYU", "anahtar", "sifre", "\u015fifre",
-    "pass", "micro", "Micro", "MICRO",
-]
-
-# Digit motifs. Nine confirmed keys are repetitions or near repetitions of a
-# short motif typed fast on a numpad.
-DIGIT_MOTIFS = [
-    "1", "3", "0", "12", "13", "21", "31", "69", "123", "312", "321", "231",
-    "132", "213", "131", "313", "1231", "3123", "1234", "4321",
 ]
 
 # Keyboard rows. Turkish Q is the layout these operators are typing on, which
@@ -238,51 +271,47 @@ SIGNATURES = [
 # ===========================================================================
 
 BACKEND = None
-_enc_blocks = None
 _dec_blocks = None
 
 
 def _init_backend(force_pure=False):
-    global BACKEND, _enc_blocks, _dec_blocks
+    """
+    Decryption only. This tool has no encrypt path and is not able to produce
+    a .cryptedmicro file: every back end below exposes AES decryption and
+    nothing else, and _PureAES has no encrypt_block. That is deliberate. A
+    victim facing recovery tool has no legitimate use for the encrypt
+    direction, and shipping one would hand anybody who reads this file a
+    working implementation of the thing that caused the damage.
+    """
+    global BACKEND, _dec_blocks
     if not force_pure:
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-            def _enc(key, data):
-                c = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
-                return c.update(data) + c.finalize()
 
             def _dec(key, data):
                 c = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
                 return c.update(data) + c.finalize()
 
-            _enc_blocks, _dec_blocks, BACKEND = _enc, _dec, "cryptography"
+            _dec_blocks, BACKEND = _dec, "cryptography"
             return
         except Exception:
             pass
         try:
             from Crypto.Cipher import AES as _AES
 
-            def _enc(key, data):
-                return _AES.new(key, _AES.MODE_ECB).encrypt(data)
-
             def _dec(key, data):
                 return _AES.new(key, _AES.MODE_ECB).decrypt(data)
 
-            _enc_blocks, _dec_blocks, BACKEND = _enc, _dec, "pycryptodome"
+            _dec_blocks, BACKEND = _dec, "pycryptodome"
             return
         except Exception:
             pass
-
-    def _enc(key, data):
-        ctx = _PureAES(key)
-        return b"".join(ctx.encrypt_block(data[i:i + 16]) for i in range(0, len(data), 16))
 
     def _dec(key, data):
         ctx = _PureAES(key)
         return b"".join(ctx.decrypt_block(data[i:i + 16]) for i in range(0, len(data), 16))
 
-    _enc_blocks, _dec_blocks, BACKEND = _enc, _dec, "pure-python"
+    _dec_blocks, BACKEND = _dec, "pure-python"
 
 
 # --- pure Python AES --------------------------------------------------------
@@ -332,7 +361,11 @@ def _mul(a, b):
 
 
 class _PureAES(object):
-    """AES-256 single block encrypt and decrypt. Correctness over speed."""
+    """AES-256 single block DECRYPTION. Correctness over speed.
+
+    There is no encrypt_block and no forward MixColumns here on purpose: this
+    class can undo the malware's work and cannot reproduce it.
+    """
 
     def __init__(self, key):
         if len(key) != 32:
@@ -361,18 +394,6 @@ class _PureAES(object):
         k = self.rk[r]
         return [s[i] ^ k[i] for i in range(16)]
 
-    def encrypt_block(self, blk):
-        s = self._ark(list(blk), 0)
-        for r in range(1, 14):
-            s = [_SBOX[b] for b in s]
-            s = self._shift(s)
-            s = self._mix(s)
-            s = self._ark(s, r)
-        s = [_SBOX[b] for b in s]
-        s = self._shift(s)
-        s = self._ark(s, 14)
-        return bytes(s)
-
     def decrypt_block(self, blk):
         s = self._ark(list(blk), 14)
         for r in range(13, 0, -1):
@@ -385,16 +406,6 @@ class _PureAES(object):
         return bytes(self._ark(s, 0))
 
     @staticmethod
-    def _shift(s):
-        o = list(s)
-        for r in range(1, 4):
-            row = [s[r + 4 * c] for c in range(4)]
-            row = row[r:] + row[:r]
-            for c in range(4):
-                o[r + 4 * c] = row[c]
-        return o
-
-    @staticmethod
     def _inv_shift(s):
         o = list(s)
         for r in range(1, 4):
@@ -402,17 +413,6 @@ class _PureAES(object):
             row = row[-r:] + row[:-r]
             for c in range(4):
                 o[r + 4 * c] = row[c]
-        return o
-
-    @staticmethod
-    def _mix(s):
-        o = [0] * 16
-        for c in range(4):
-            a = s[4 * c:4 * c + 4]
-            o[4 * c + 0] = _mul(a[0], 2) ^ _mul(a[1], 3) ^ a[2] ^ a[3]
-            o[4 * c + 1] = a[0] ^ _mul(a[1], 2) ^ _mul(a[2], 3) ^ a[3]
-            o[4 * c + 2] = a[0] ^ a[1] ^ _mul(a[2], 2) ^ _mul(a[3], 3)
-            o[4 * c + 3] = _mul(a[0], 3) ^ a[1] ^ a[2] ^ _mul(a[3], 2)
         return o
 
     @staticmethod
@@ -449,9 +449,14 @@ def strip_pkcs5(data):
     return data[:-n]
 
 
-def add_pkcs5(data):
-    n = 16 - (len(data) % 16)
-    return data + bytes([n]) * n
+def padded_length(n):
+    """
+    Length the ciphertext must have for a plaintext of n bytes under PKCS#5.
+    This replaces an add_pkcs5() helper that actually built the padded bytes:
+    only the length is ever needed, and constructing padded plaintext is a
+    step on the way to encrypting it, which this tool does not do.
+    """
+    return n + (16 - (n % 16))
 
 
 def identify(head):
@@ -562,6 +567,26 @@ def _valid_text(pt, enc):
         return False
 
 
+def _valid_plain_text(pt, min_len=16):
+    """
+    Text has no magic number, so identify() never labels it and every text
+    file used to fall through as unrecognised. UTF-8 is the discriminator that
+    makes this safe: a wrong key yields uniformly random bytes, and random
+    bytes of any real length are valid UTF-8 with vanishing probability, so
+    this does not hand back garbage as a recovery.
+    """
+    if len(pt) < min_len:
+        return False
+    try:
+        txt = pt.decode("utf-8")
+    except Exception:
+        return False
+    if not txt:
+        return False
+    printable = sum(1 for c in txt if c.isprintable() or c in "\r\n\t")
+    return printable / float(len(txt)) >= 0.95
+
+
 def _valid_ole(pt):
     return pt[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" and len(pt) >= 512
 
@@ -594,6 +619,8 @@ def validate_plaintext(pt):
     """
     label, _, strong = identify_ex(pt[:16])
     if not label:
+        if _valid_plain_text(pt):
+            return True, "plain text"
         return False, None
     fn = VALIDATORS.get(label)
     if fn is not None:
@@ -620,11 +647,15 @@ def decrypt_file(path, key_string, verify=True):
         return None, False, "file is empty"
     if len(ct) % 16 != 0:
         return None, False, "length %d is not a multiple of 16, not a whole ciphertext" % len(ct)
+    if _dec_blocks is None:
+        # decrypt_file is usable as a library, not only from main(). Without
+        # this the first call raises an opaque TypeError on a None global.
+        _init_backend()
     kb = key_bytes(key_string)
     pt = strip_pkcs5(_dec_blocks(kb, ct))
     if pt is None:
         return None, False, "PKCS#5 padding invalid, wrong key for this file"
-    if len(add_pkcs5(pt)) != len(ct):
+    if padded_length(len(pt)) != len(ct):
         return None, False, "recovered length inconsistent with ciphertext"
     if not verify:
         return pt, False, None
@@ -726,7 +757,7 @@ def collect(root, recursive):
 
 
 # ===========================================================================
-# SECTION 6. Candidate generation, modelled on this crew's key history.
+# SECTION 6a. Mutation helpers.
 #
 # Every confirmed key falls into one of six shapes. The generators below are
 # built from those shapes and ordered cheapest and likeliest first, so a hit
@@ -763,181 +794,383 @@ def _transpositions(s):
     return [s[:i] + s[i + 1] + s[i] + s[i + 2:] for i in range(len(s) - 1)]
 
 
-def gen_known():
-    for k in KNOWN_KEYS:
-        yield k
+def _cls(c):
+    if c.isdigit():
+        return "d"
+    if c.isalpha():
+        return "u" if c.isupper() else "l"
+    return "s"
 
 
-def gen_known_variants(max_suffix=99):
-    """Case, Turkish folding, adjacent transpositions and numeric suffixes of
-    every confirmed key. Operators reuse and lightly mutate their own keys."""
-    seen = set(KNOWN_KEYS)
-    base = []
-    for k in KNOWN_KEYS:
-        base.extend(_case_variants(k))
-        base.append(_fold(k))
-        base.append(_unfold(_fold(k)))
-        base.extend(_transpositions(k))
-    for b in base:
-        if b not in seen:
-            seen.add(b)
-            yield b
-    for b in list(seen):
-        for n in range(max_suffix + 1):
-            for cand in (b + str(n), str(n) + b):
-                if cand not in seen:
-                    seen.add(cand)
-                    yield cand
+def _rotations(s):
+    return [s[i:] + s[:i] for i in range(len(s))]
 
 
-def gen_prefix_digits(max_digits=5):
-    """Shape A. Prefix plus a digit run, the most common observed shape."""
-    for prefix in KEY_PREFIXES:
-        for width in range(1, max_digits + 1):
-            for n in range(10 ** width):
-                yield prefix + str(n).zfill(width)
+# ===========================================================================
+# ===========================================================================
+# SECTION 6. The fitted key model. Fitted from KNOWN_KEYS at import time: the
+# alphabets, length prior, affix widths, tiling motifs and the share of the
+# sweep each family gets are all measured, none are hand ranked.
+# ===========================================================================
 
+class KeyModel(object):
+    """Fitted from the recovered keys. Holds no hardcoded key material."""
 
-def gen_handles(max_suffix=999):
-    """Shape B. Operator handle, optionally with digits, plus transpositions."""
-    seen = set()
-    for h in OPERATOR_HANDLES:
-        for v in _case_variants(h) + _transpositions(h) + [_fold(h)]:
-            if v not in seen:
-                seen.add(v)
-                yield v
-    for h in OPERATOR_HANDLES:
-        for v in _case_variants(h):
-            for n in range(max_suffix + 1):
-                yield v + str(n)
+    def __init__(self, keys=None, handles=None, words=None, vocab=None):
+        self.keys = list(keys if keys is not None else KNOWN_KEYS)
+        self.handles = list(handles if handles is not None else OPERATOR_HANDLES)
+        self.words = list(words if words is not None else TURKISH_SEEDS)
+        self.vocab = list(vocab if vocab is not None else TURKISH_VOCAB)
+        self._fit()
 
+    # ---------------------------------------------------------------- fit
+    def _fit(self):
+        K = self.keys
+        n = float(max(len(K), 1))
 
-def gen_motifs(max_len=28):
-    """Shape C. A short digit motif hammered out to length."""
-    seen = set()
-    for m in DIGIT_MOTIFS:
-        for L in range(1, max_len + 1):
-            s = (m * (L // len(m) + 1))[:L]
-            if s not in seen:
+        # Class alphabets, ordered by observed frequency. Unobserved but
+        # plausible characters follow so they stay reachable, ranked last.
+        tail = {
+            "d": "0123456789",
+            "l": "abcdefghijklmnopqrstuvwxyz" + "".join(FOLD_MAP.keys()).lower(),
+            "u": "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + "".join(UNFOLD_MAP.values()).upper(),
+            "s": "*-_. ",
+        }
+        freq = dict((t, collections.Counter()) for t in "dlus")
+        for k in K:
+            for c in k:
+                freq[_cls(c)][c] += 1
+        self.alpha = {}
+        for t in "dlus":
+            seen = [c for c, _ in freq[t].most_common()]
+            self.alpha[t] = seen + [c for c in tail[t] if c not in seen]
+        self.freq = freq
+
+        # Length prior, observed range only, widened by one either side.
+        lens = [len(k) for k in K] or [8]
+        lo, hi = max(1, min(lens) - 1), min(32, max(lens) + 1)
+        lc = collections.Counter(lens)
+        self.lengths = sorted(range(lo, hi + 1),
+                              key=lambda L: (-lc.get(L, 0), abs(L - 11)))
+
+        # Structural classification, which also gives the family weights.
+        self.stems = collections.Counter()
+        self.tail_widths = collections.Counter()
+        self.motifs = collections.Counter()
+        fam = collections.Counter()
+
+        for k in K:
+            m = re.match(r"^([^\W\d_]+)(\d+)$", k, re.UNICODE)
+            if m:
+                fam["stem"] += 1
+                self.stems[m.group(1)] += 1
+                self.tail_widths[len(m.group(2))] += 1
+                continue
+            if k.isdigit() or all(not c.isalpha() for c in k):
+                fam["digit"] += 1
+                for p in range(1, min(5, len(k)) + 1):
+                    self.motifs[k[:p]] += 1
+                continue
+            if k.isalpha() and (sum(c.isupper() for c in k) == 0):
+                fam["word"] += 1
+                self.stems[k] += 1
+                continue
+            fam["motor"] += 1
+
+        self.family_mass = {}
+        for f in ("stem", "digit", "motor", "word"):
+            self.family_mass[f] = max(fam.get(f, 0), 1) / n
+
+        # Digit alphabet actually used, most frequent first. This is the
+        # single biggest ordering win over uniform enumeration.
+        self.digits = [c for c in self.alpha["d"] if freq["d"].get(c)]
+        if not self.digits:
+            self.digits = list("0123456789")
+
+        # Mash alphabet for the motor family, fitted, uppercase and lowercase.
+        mash = [c for c, _ in freq["u"].most_common()] + \
+               [c for c, _ in freq["l"].most_common()]
+        self.mash_alpha = mash[:12] or list("KL")
+
+        # Observed separators, for keys like 123*01923*0123.
+        self.seps = [c for c, _ in freq["s"].most_common()] or ["*"]
+
+        # Stem pool: fitted stems first, then the C2 derived seed lists.
+        pool = collections.OrderedDict()
+        for s, _ in self.stems.most_common():
+            pool[s] = True
+        for s in self.handles + self.words:
+            for v in _case_variants(s) + [_fold(s), _unfold(_fold(s))]:
+                if v and v.isalpha():
+                    pool.setdefault(v, True)
+        self.stem_pool = list(pool)
+
+        # Vocabulary is a SEPARATE pool. Merged in, its ~200 extra stems
+        # multiply through every tail width and push the C2 derived stems out
+        # of a realistic budget.
+        vpool = collections.OrderedDict()
+        for s in self.vocab:
+            for v in (s, s.capitalize(), _fold(s)):
+                if v and v.isalpha() and v not in pool:
+                    vpool.setdefault(v, True)
+        self.vocab_pool = list(vpool)
+
+        # Single letter extensions of fitted stems, so keyu3131 is reachable
+        # from key without hardcoding the prefix.
+        ext = []
+        for st, _ in self.stems.most_common():
+            if st.isalpha() and len(st) <= 8:
+                for c in self.alpha["l"][:14]:
+                    ext.append(st + c)
+        self.stem_ext = ext
+
+        # Tail widths seen on real keys, most common first.
+        self.tail_order = [w for w, _ in self.tail_widths.most_common()] or [4]
+        for w in (1, 2, 3, 4, 5, 6):
+            if w not in self.tail_order:
+                self.tail_order.append(w)
+
+    # ------------------------------------------------------------ families
+    def gen_known(self):
+        for k in self.keys:
+            yield k
+
+    def gen_known_variants(self):
+        """Case, Turkish folding, adjacent transposition and short affixes of
+        every confirmed key. zarox to zarxo is a confirmed real mutation."""
+        seen = set()
+        base = []
+        for k in self.keys:
+            base.extend(_case_variants(k))
+            base.append(_fold(k))
+            base.append(_unfold(_fold(k)))
+            base.extend(_transpositions(k))
+        for b in base:
+            if b and b not in seen:
+                seen.add(b)
+                yield b
+        for b in list(seen):
+            for d in self.digits:
+                for cand in (b + d, d + b):
+                    if cand not in seen:
+                        seen.add(cand)
+                        yield cand
+
+    def gen_stem(self):
+        """Stem plus digit tail. The digit alphabet and its order are fitted,
+        so key3131 and keyu3131 are reached before key0000 ever is.
+
+        Tail widths are walked in ascending cost, not descending probability:
+        a width costs len(stems) * len(digits) ** width."""
+        seen = set()
+        for st in self.stem_pool:
+            if st not in seen:
+                seen.add(st)
+                yield st
+        for st in self.vocab_pool:
+            if st not in seen:
+                seen.add(st)
+                yield st
+        # Every pool at the cheap widths, then operator stems at the expensive
+        # widths, then vocabulary. Both operator keys and name based keys land
+        # inside budget this way; neither pure ordering manages both.
+        max_w = max(self.tail_order[:1] + [4]) + 1
+        cheap = 2
+        phases = []
+        for w in range(1, cheap + 1):
+            phases.extend([(g, w) for g in
+                           (self.stem_pool, self.stem_ext, self.vocab_pool)])
+        for w in range(cheap + 1, max_w + 1):
+            phases.append((self.stem_pool, w))
+        for w in range(cheap + 1, max_w + 1):
+            phases.extend([(self.stem_ext, w), (self.vocab_pool, w)])
+        for group, width in phases:
+            for st in group:
+                for tup in itertools.product(self.digits, repeat=width):
+                    cand = st + "".join(tup)
+                    if cand not in seen:
+                        seen.add(cand)
+                        yield cand
+
+    def gen_digit(self):
+        """Digit keys. Motif tilings and rotations first, then a weighted
+        odometer over the observed digit alphabet."""
+        seen = set()
+
+        def emit(s):
+            if s and s not in seen:
                 seen.add(s)
-                yield s
-    # motif with a separator, as in 123*01923*0123
-    for m in DIGIT_MOTIFS:
-        for sep in ("*", "-", "_", ".", " "):
-            for reps in range(2, 5):
-                yield sep.join([m] * reps)
+                return True
+            return False
 
+        motifs = [m for m, _ in self.motifs.most_common()]
+        tilings = []
+        for m in motifs:
+            for r in _rotations(m):
+                for L in self.lengths:
+                    s = (r * (L // len(r) + 1))[:L]
+                    if emit(s):
+                        tilings.append(s)
+                        yield s
 
-def gen_keyboard(min_len=3, max_len=14):
-    """Shape D. Row runs, reversed runs, doubled runs and column zigzags."""
-    seen = set()
-
-    def emit(s):
-        for v in (s, s.upper()):
-            if v and v not in seen:
-                seen.add(v)
-                yield v
-
-    for row in KEYBOARD_ROWS:
-        for start in range(len(row)):
-            for L in range(min_len, min(max_len, len(row) - start) + 1):
-                run = row[start:start + L]
-                for v in emit(run):
+        # Near misses: several recovered keys are a tiling the operator
+        # fumbled, one transposition or one dropped character out.
+        for base in tilings:
+            if len(base) < 6:
+                continue
+            for v in _transpositions(base):
+                if emit(v):
                     yield v
-                for v in emit(run[::-1]):
+            for i in range(len(base)):
+                v = base[:i] + base[i + 1:]
+                if emit(v):
                     yield v
-                for v in emit(run + run):
-                    yield v
+        for width in (2, 3, 4):
+            for tup in itertools.product(self.digits, repeat=width):
+                m = "".join(tup)
+                for r in _rotations(m):
+                    for L in self.lengths:
+                        s = (r * (L // len(r) + 1))[:L]
+                        if emit(s):
+                            yield s
+        for m in motifs:
+            for sep in self.seps:
+                for reps in (2, 3, 4):
+                    s = sep.join([m] * reps)
+                    if emit(s):
+                        yield s
+        for L in self.lengths:
+            if L > 9:
+                continue
+            for tup in itertools.product(self.digits, repeat=L):
+                s = "".join(tup)
+                if emit(s):
+                    yield s
 
-    # zigzag walks across adjacent columns, which is what edrftgybhunjk is
-    rows = (KEYBOARD_ROWS[0], KEYBOARD_ROWS[1], KEYBOARD_ROWS[2])
-    for a, b in ((0, 1), (1, 2), (0, 2)):
-        for start in range(len(rows[a])):
-            for L in range(min_len, max_len + 1):
-                walk = []
-                for i in range(L):
-                    row = rows[a] if i % 2 == 0 else rows[b]
-                    col = start + i // 2
-                    if col < len(row):
-                        walk.append(row[col])
-                if len(walk) >= min_len:
-                    for v in emit("".join(walk)):
-                        yield v
+    def gen_motor(self):
+        """Keyboard runs, reversals, doubles and column zigzags on the Turkish
+        Q layout, then mashes over the fitted mash alphabet."""
+        seen = set()
 
-
-def gen_caps_mash(max_len=5):
-    """Shape E. Short mashes over the exact alphabet these operators use:
-    K, L, Q, W, E, S, \u015e and digits. Kept short on purpose, because this
-    family explodes fast."""
-    alpha = "KL\u015eQWES1234"
-    seen = set()
-    for L in range(2, min(max_len, 5) + 1):
-        for tup in itertools.product(alpha, repeat=L):
-            s = "".join(tup)
-            if s not in seen:
+        def emit(s):
+            if s and s not in seen:
                 seen.add(s)
-                yield s
-    for L in range(6, max_len + 1):
-        for tup in itertools.product("K\u015eL234", repeat=L):
-            s = "".join(tup)
-            if s not in seen:
-                seen.add(s)
-                yield s
+                return True
+            return False
+
+        for row in KEYBOARD_ROWS:
+            for start in range(len(row)):
+                for L in range(3, len(row) - start + 1):
+                    run = row[start:start + L]
+                    for v in (run, run.upper(), run[::-1], run[::-1].upper(),
+                              run + run, (run + run).upper()):
+                        if emit(v):
+                            yield v
+
+        rows = KEYBOARD_ROWS[:3]
+        for a, b in ((0, 1), (1, 2), (0, 2)):
+            for start in range(len(rows[a])):
+                for L in range(3, 15):
+                    walk = []
+                    for i in range(L):
+                        row = rows[a] if i % 2 == 0 else rows[b]
+                        col = start + i // 2
+                        if col < len(row):
+                            walk.append(row[col])
+                    if len(walk) >= 3:
+                        w = "".join(walk)
+                        for v in (w, w.upper()):
+                            if emit(v):
+                                yield v
+
+        for L in self.lengths:
+            if L > 6:
+                continue
+            for tup in itertools.product(self.mash_alpha, repeat=L):
+                s = "".join(tup)
+                if emit(s):
+                    yield s
+
+    def gen_word(self):
+        """Word plus affix. anansinmi and its Turkish spelling are the
+        confirmed members of this family."""
+        seen = set()
+        for w in self.words:
+            for v in _case_variants(w) + [_fold(w), _unfold(_fold(w))]:
+                if v and v not in seen:
+                    seen.add(v)
+                    yield v
+        for width in range(1, 4):
+            for w in self.words:
+                for v in _case_variants(w):
+                    for tup in itertools.product(self.digits, repeat=width):
+                        cand = v + "".join(tup)
+                        if cand not in seen:
+                            seen.add(cand)
+                            yield cand
+
+    # ---------------------------------------------------------- scheduling
+    def interleaved(self, deep=False):
+        """Round robin across the families, each family getting a share of
+        every cycle proportional to the mass of recovered keys it explains.
+        Nothing starves behind another family's long tail."""
+        fams = [
+            ("stem", self.gen_stem()),
+            ("digit", self.gen_digit()),
+            ("motor", self.gen_motor()),
+            ("word", self.gen_word()),
+        ]
+        quota = []
+        for name, gen in fams:
+            share = max(1, int(round(self.family_mass.get(name, 0.235) * 40)))
+            quota.append([name, gen, share * (4 if deep else 1)])
+        seen = set()
+        live = True
+        while live:
+            live = False
+            for entry in quota:
+                name, gen, share = entry
+                if gen is None:
+                    continue
+                for _ in range(share):
+                    try:
+                        cand = next(gen)
+                    except StopIteration:
+                        entry[1] = None
+                        break
+                    live = True
+                    if cand not in seen:
+                        seen.add(cand)
+                        yield cand
 
 
-def gen_words(max_suffix=99):
-    """Turkish and English seeds with numeric suffixes and folding."""
-    seen = set()
-    for w in TURKISH_SEEDS:
-        for v in _case_variants(w) + [_fold(w), _unfold(_fold(w))]:
-            if v not in seen:
-                seen.add(v)
-                yield v
-    for w in TURKISH_SEEDS:
-        for v in _case_variants(w):
-            for n in range(max_suffix + 1):
-                yield v + str(n)
+MODEL = None
 
 
-def gen_digits(max_digits=6):
-    """Shape F. Exhaustive digit runs. Cheap because there is no KDF."""
-    for width in range(1, max_digits + 1):
-        for n in range(10 ** width):
-            yield str(n).zfill(width)
-
-
-def gen_alnum(max_len=4):
-    """Last resort, exhaustive lowercase alphanumeric. Only under --deep."""
-    alpha = string.ascii_lowercase + string.digits
-    for L in range(1, max_len + 1):
-        for tup in itertools.product(alpha, repeat=L):
-            yield "".join(tup)
+def get_model():
+    global MODEL
+    if MODEL is None:
+        MODEL = KeyModel()
+    return MODEL
 
 
 def build_plan(brute=False, deep=False, extra=None, wordlist=None):
     """
-    Ordered list of (tier name, generator factory). Cheapest and most likely
-    first. Without --brute only the supplied keys, the wordlist and the known
-    keys are tried.
+    Ordered list of (tier name, generator factory), consumed by sweep().
+    Without --brute only supplied keys, the wordlist and the recovered keys
+    are tried. With --brute the fitted model runs as one interleaved stream.
     """
     plan = []
     if extra:
         plan.append(("supplied keys", lambda: iter(list(extra))))
     if wordlist:
         plan.append(("wordlist", lambda: iter(list(wordlist))))
-    plan.append(("known operator keys", gen_known))
+    m = get_model()
+    plan.append(("recovered operator keys", m.gen_known))
     if not brute:
         return plan
-    plan.append(("known key variants", gen_known_variants))
-    plan.append(("operator handles", gen_handles))
-    plan.append(("digit motifs", gen_motifs))
-    plan.append(("keyboard mashes", gen_keyboard))
-    plan.append(("Turkish and English words", gen_words))
-    plan.append(("prefix plus digits", lambda: gen_prefix_digits(6 if deep else 5)))
-    plan.append(("uppercase mashes", lambda: gen_caps_mash(7 if deep else 5)))
-    plan.append(("digit runs", lambda: gen_digits(8 if deep else 6)))
-    if deep:
-        plan.append(("alphanumeric", lambda: gen_alnum(4)))
+    plan.append(("recovered key variants", m.gen_known_variants))
+    plan.append(("fitted model", lambda: KeyModel().interleaved(deep=deep)))
     return plan
 
 
@@ -1101,6 +1334,34 @@ def map_keys_to_files(files, keys):
                 hits.append(p)
         if hits:
             mapping[k] = hits
+
+    # Second pass. A file whose plaintext has no magic number (text, CSV,
+    # source, config, anything not in SIGNATURES) is invisible to the header
+    # check above, so it used to be reported as "no key found" even when the
+    # key was already proven on the machine. On the synthetic corpus that was
+    # 90 of 463 files. Padding plus length agreement is weak evidence on its
+    # own, which is why it is only accepted for a key that has already been
+    # proven structurally somewhere else in this run.
+    covered = set()
+    for hits in mapping.values():
+        covered.update(hits)
+    for k in mapping:
+        kb = key_bytes(k)
+        for p in files:
+            if p in covered:
+                continue
+            try:
+                with open(p, "rb") as fh:
+                    ct = fh.read()
+            except OSError:
+                continue
+            if not ct or len(ct) % 16:
+                continue
+            pt = strip_pkcs5(_dec_blocks(kb, ct))
+            if pt is None or padded_length(len(pt)) != len(ct):
+                continue
+            mapping[k].append(p)
+            covered.add(p)
     return mapping
 
 
@@ -1189,6 +1450,9 @@ def main(argv=None):
                        help="overwrite instead of adding a numeric suffix")
     g_out.add_argument("--keep-unverified", action="store_true",
                        help="also write files that failed verification, suffixed .UNVERIFIED")
+    g_out.add_argument("--strict", action="store_true",
+                       help="do not write anything that failed structural verification, "
+                            "even under a key already proven on this machine")
     g_out.add_argument("--fix-ext", action="store_true",
                        help="correct extensions that disagree with the recovered magic bytes")
     g_out.add_argument("--force", action="store_true",
@@ -1280,12 +1544,18 @@ def main(argv=None):
             print("  * The key is a string the operator typed. It is not derived from")
             print("    anything in the file and cannot be read out of the ciphertext.")
             print("    AES-256 itself is not broken here and is not being attacked.")
-            print("  * Check shadow copies, undelete and file carving. This family does")
-            print("    not delete Volume Shadow Copies and does not overwrite originals")
-            print("    before deleting them, so all three are live options.")
-            print("  * If the machine is still on and infected, the key may still be in")
-            print("    memory. Take it off the network but leave it powered on.")
-            print("  * Do not pay, and do not run the attackers' own !unmicro command.")
+            print("  * Do not assume the machine's own recovery paths survived. This")
+            print("    crew disables Windows Recovery, Task Manager and Regedit, and")
+            print("    adds a Defender exclusion. Check what is actually left rather")
+            print("    than counting on it.")
+            print("  * Do not wipe the machine and do not delete the encrypted files.")
+            print("    That is what turns a recoverable situation into a permanent one.")
+            print("  * If the machine is still on and infected, the key may still be")
+            print("    in memory. Take it off the network but leave it powered on, and")
+            print("    get a responder to look before anyone reboots it.")
+            print("  * Do not pay. Their decryption is issued from their own bot to the")
+            print("    implant on your machine, so it means keeping the infection alive")
+            print("    and letting their code run again.")
             print("  * Keep every encrypted file. Mention Chattering Magpies when you")
             print("    post about this so the case gets picked up faster.")
             return 2
@@ -1310,6 +1580,20 @@ def main(argv=None):
     recovered = unverified = failed = 0
     handled = set()
 
+    # A key is proven once any one file under it validates structurally. From
+    # that point the key is not in question, so the remaining files under it
+    # are written rather than withheld. They still carry the .UNVERIFIED
+    # suffix, because their contents were never structurally checked. --strict
+    # restores the old behaviour of writing nothing unverified.
+    proven = set()
+    if not forced:
+        for key_string, hits in mapping.items():
+            for path in hits[:6]:
+                _, ver, _ = decrypt_file(path, key_string, verify=True)
+                if ver:
+                    proven.add(key_string)
+                    break
+
     for key_string, hits in mapping.items():
         for path in hits:
             if path in handled:
@@ -1322,7 +1606,9 @@ def main(argv=None):
                 print("  FAIL   %s  (%s)" % (os.path.basename(path), err))
                 failed += 1
                 continue
-            if not verified and not forced and not args.keep_unverified:
+            allow = (args.keep_unverified
+                     or (key_string in proven and not args.strict))
+            if not verified and not forced and not allow:
                 print("  FAIL   %s  (%s, not written, use --keep-unverified)"
                       % (os.path.basename(path), err or "unverified"))
                 failed += 1
@@ -1358,7 +1644,10 @@ def main(argv=None):
                              label or "unrecognised type, not structurally checked"))
             else:
                 unverified += 1
-                print("  WARN   %s written unverified" % os.path.basename(dest))
+                if not args.quiet:
+                    print("  PROVEN %-56s %10d bytes  %s"
+                          % (os.path.basename(dest)[:56], len(pt),
+                             "key proven on this machine, structure not checked"))
 
     leftover = [f for f in files if f not in handled]
 
@@ -1366,7 +1655,8 @@ def main(argv=None):
     print("Recovered and verified : %d" % recovered)
     if unverified:
         print("Written unverified     : %d%s" % (unverified,
-              "  (forced key, structure not checked)" if forced else ""))
+              "  (forced key, structure not checked)" if forced
+              else "  (proven key, structure not checked, .UNVERIFIED suffix)"))
     if failed:
         print("Failed                 : %d" % failed)
     if leftover:
