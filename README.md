@@ -223,6 +223,13 @@ above.
 Run any build with `--version` to see which release you have, and
 `--self-test` to confirm it unpacked intact (both run without a license).
 
+**Double-clicking the Windows binary** runs it with no options: full-auto,
+which searches every drive, tries every route and writes to
+`unmicro-recovered` in the folder the binary sits in. When the run ends the
+window stays open until you press Enter, so the result can be read. Pressing
+Ctrl+C during the key search stops it and still writes every file already
+matched to a key.
+
 ## Requirements
 
 **Binaries:** nothing. Python is not needed and nothing has to be installed.
@@ -329,7 +336,10 @@ structure of the file before it counts:
 For the newer AES-GCM files (see below) none of that is needed: the 128-bit
 authentication tag either matches or it does not, and a match proves the key
 and every byte of the file. Those lines are marked `[GCM, tag verified]`, and
-a GCM file is never written unless its tag matched.
+a GCM file is never written unless its tag matched. (The output is streamed
+into a temporary `.part` file and only renamed into place once the tag has
+verified; otherwise the `.part` file is deleted. That way a multi-gigabyte
+video never has to fit in memory.)
 
 Three outcomes appear in the output:
 
@@ -426,11 +436,29 @@ and (under `--brute`) the recovered key variants, and leaves the fitted model
 and the structural brute to the older files, where they finish in a sensible
 time. The GPU path is not used for GCM.
 
+Because a GCM guess is so expensive, each one is checked against two files at
+a time, starting with the smallest, and a key that opens one of them is then
+tried on every other file. The smallest files are also the likeliest to be
+partial copies left by an interrupted encryption run, so if the supplied and
+recovered keys open neither of the first two, they are tried on the next two,
+and so on through up to 16 files. When nothing opens at all, the output says
+how many of the GCM files were actually tested. If you know some files are
+intact, running `--in` on a folder of just those is the quickest check.
+
+Once a key has opened files, the files it did not open are swept again on
+their own. In full-auto (no options, or a double-click) that second sweep
+skips the slow recovered key variants, so the files already opened are
+written in minutes rather than after an hour. Run with `--brute` explicitly
+to include the variants for the stragglers.
+
 Telling the formats apart: a GCM file is the original length plus 44 bytes, so
 it is a whole number of AES blocks only one time in sixteen, while an ECB file
 always is. Files that cannot be ECB go straight to the GCM search. Block
-aligned files go through the ECB search, and any of those it cannot open, or
-that a GCM key from the same machine opens, are treated as GCM.
+aligned files are first tried with the quick key sources (supplied keys,
+wordlist, recovered keys, scavenged strings) as ECB and then as GCM, before
+any open-ended search starts. Whatever is still closed then goes through the
+ECB search, and anything that does not open as ECB, or that a GCM key from
+the same machine opens, is treated as GCM.
 
 ---
 
@@ -466,6 +494,15 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Edge-case fixes (3.8.2).** A machine-wide or double-click run could report
+  0 hits on files the recovered keys open, if the two smallest GCM files were
+  partial or under another key; the recovered keys now move on through up to
+  16 files. `--auto` no longer skips user folders named `Dev`, `Run`,
+  `Recovery`, `Windows`, `Snap`, `Sys` or `Proc` below the top of a drive, and
+  finds `.CRYPTEDMICRO` in any letter case. Block-aligned GCM files are no
+  longer held behind the ECB brute force. The double-click window stays open
+  at the end, Ctrl+C writes what is already matched, and GCM output is
+  streamed to disk. See CHANGELOG.md.
 - **AES-GCM files (3.8).** Newer builds of the malware encrypt with
   AES-256-GCM under a PBKDF2-SHA256 key, still to `.cryptedmicro`. unmicro now
   recovers both formats in one run, works out which one each file is, and
@@ -559,7 +596,7 @@ report the device.
 | `--auto` | search every drive and user location for encrypted files |
 | `--brute` | sweep generated candidates when the recovered keys do not fit |
 | `--deep` | widen every family, including the layout walker. Hours, not seconds |
-| `--dumb-brute` | plain structural brute force, 3 chars up to the longest key, over the Turkish+English alphabet. Asks before a length that would take too long |
+| `--dumb-brute` | plain structural brute force, 1 character up to the longest key, over the Turkish+English alphabet. Asks before a length that would take too long |
 | `--charset observed\|turkish\|full` | alphabet for `--dumb-brute` (default `turkish`: Turkish and English lowercase and digits) |
 | `--scavenge FILE` | pull candidate keys out of an unencrypted dump (memory image, pagefile, strings listing) and try them first. Repeatable |
 | `--checkpoint FILE` | save sweep progress and resume from it, so an interrupted or capped run continues |
