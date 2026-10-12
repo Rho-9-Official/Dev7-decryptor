@@ -93,6 +93,12 @@ jobs:
           --only-binary=:all:
           -r requirements-build.txt
 
+      # Edge-case regression tests. The end-to-end ones need the license key
+      # and skip without it, which CI never has; the rest build their own
+      # fixtures with the pinned pycryptodome installed above.
+      - name: Regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Read version from unmicro.py
         id: ver
         shell: bash

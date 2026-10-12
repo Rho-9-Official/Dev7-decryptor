@@ -25,7 +25,7 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '3.8.1'
+VERSION = '3.8.2'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
 # Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the
@@ -43,6 +43,17 @@ GCM_READ_CHUNK = 1 << 20
 # 600,000-round PBKDF2 there, so the open-ended generators (fitted model,
 # structural brute) are left to the ECB files.
 GCM_TIERS = ('supplied keys', 'wordlist', 'recovered operator keys', 'scavenged strings', 'recovered key variants')
+# A GCM guess is checked against GCM_PROBES files at a time. For the bounded
+# tiers below, a miss on those files moves on to the next GCM_PROBES, up to
+# GCM_ROTATE_FILES files in all, so one truncated or foreign file among the
+# smallest can no longer hide a key that opens everything else.
+GCM_PROBES = 2
+GCM_ROTATE_FILES = 16
+GCM_ROTATE_TIERS = ('supplied keys', 'recovered operator keys')
+GCM_PROBE_CACHE_CAP = 4
+# Tiers cheap enough to run in both formats before any open-ended search, so
+# a block-aligned GCM file is not left waiting behind the ECB brute.
+QUICK_TIERS = ('supplied keys', 'wordlist', 'recovered operator keys', 'scavenged strings')
 SEEN_CAP = 1000000
 DEFAULT_OUT_DIR = 'unmicro-recovered'
 ENGLISH_LOWER = 'abcdefghijklmnopqrstuvwxyz'
@@ -966,10 +977,12 @@ def gcm_header(path):
         tag = _read_exact(fh, GCM_TAG_LEN)
     return (size, salt, iv, tag)
 
-def gcm_stream(path, size, iv, tag, dk, keep=True):
+def gcm_stream(path, size, iv, tag, dk, keep=True, sink=None):
     """Run GCM over the file body under derived key dk. Returns
     (plaintext or b'' when keep is False, None) once the tag verifies, or
-    (None, reason). No plaintext leaves here unless the tag matched."""
+    (None, reason). No plaintext is returned unless the tag matched. With
+    sink, plaintext is also written to it as it is produced, so the caller
+    must discard what it wrote unless the reason is None."""
     if _gcm_new is None:
         _init_backend()
     ctx = _gcm_new(dk, iv, tag)
@@ -986,6 +999,8 @@ def gcm_stream(path, size, iv, tag, dk, keep=True):
                 pt = ctx.update(chunk)
                 if keep:
                     out.append(pt)
+                if sink is not None:
+                    sink.write(pt)
     except OSError as e:
         return (None, 'cannot read: %s' % e)
     if not ctx.verify():
@@ -998,6 +1013,21 @@ def gcm_open_file(path, key_string, keep=True):
     except (OSError, ValueError) as e:
         return (None, str(e))
     return gcm_stream(path, size, iv, tag, gcm_derive_key(key_string, salt), keep=keep)
+
+def gcm_decrypt_to(path, key_string, sink):
+    """Stream a GCM file's plaintext into sink. Returns None once the tag
+    verifies, else the reason; on a reason the caller discards sink."""
+    try:
+        size, salt, iv, tag = gcm_header(path)
+    except (OSError, ValueError) as e:
+        return str(e)
+    return gcm_stream(path, size, iv, tag, gcm_derive_key(key_string, salt), keep=False, sink=sink)[1]
+
+def _remove_quietly(path):
+    try:
+        os.remove(long_path(path))
+    except OSError:
+        pass
 
 def _decrypt_gcm(path, key_string):
     pt, err = gcm_open_file(path, key_string, keep=True)
@@ -1042,7 +1072,17 @@ def decrypt_file(path, key_string, verify=True, scheme='ecb'):
     if not ok:
         return (pt, False, '%s structure did not validate' % label if label else 'no recognised file structure')
     return (pt, True, None)
-PRUNE_DIRS = {'$recycle.bin', 'system volume information', 'windows', 'winsxs', '$windows.~bt', '$windows.~ws', 'recovery', 'node_modules', '.git', '.svn', '__pycache__', 'site-packages', 'proc', 'sys', 'dev', 'run', 'snap', '.cache', '.gradle', '.m2'}
+# Skipped wherever they appear: system-volume, tool and cache folders that
+# never hold a user's own documents.
+PRUNE_DIRS = {'$recycle.bin', 'system volume information', 'winsxs', '$windows.~bt', '$windows.~ws', 'node_modules', '.git', '.svn', '__pycache__', 'site-packages', '.cache', '.gradle', '.m2'}
+# Skipped only directly under a scan root (C:\Windows, /proc, /dev, ...). A
+# user folder called Dev, Run or Recovery further down is still searched.
+PRUNE_ROOT_DIRS = {'windows', 'recovery', 'proc', 'sys', 'dev', 'run', 'snap'}
+
+def is_encrypted_name(name):
+    # Windows names are case-insensitive, and copies made through other
+    # tools can come back as .CRYPTEDMICRO.
+    return name.lower().endswith(EXT)
 
 def candidate_roots():
     roots = []
@@ -1087,9 +1127,10 @@ def walk_for_encrypted(roots, prune=True, progress=True, limit=None):
                 walked += 1
                 seen_dirs += 1
                 if prune:
-                    dirnames[:] = [d for d in dirnames if d.lower() not in PRUNE_DIRS]
+                    skip = PRUNE_DIRS | PRUNE_ROOT_DIRS if walked == 1 else PRUNE_DIRS
+                    dirnames[:] = [d for d in dirnames if d.lower() not in skip]
                 for name in filenames:
-                    if name.endswith(EXT):
+                    if is_encrypted_name(name):
                         found.append(plain_path(os.path.join(dirpath, name)))
                         if limit and len(found) >= limit:
                             if progress:
@@ -1107,12 +1148,12 @@ def walk_for_encrypted(roots, prune=True, progress=True, limit=None):
 
 def collect(root, recursive):
     if os.path.isfile(root):
-        return [os.path.abspath(root)] if root.endswith(EXT) else []
+        return [os.path.abspath(root)] if is_encrypted_name(root) else []
     out = []
     walk_root = long_path(root) if WINDOWS else root
     for dirpath, dirnames, filenames in os.walk(walk_root, onerror=lambda e: None):
         for name in filenames:
-            if name.endswith(EXT):
+            if is_encrypted_name(name):
                 out.append(plain_path(os.path.abspath(os.path.join(dirpath, name))))
         if not recursive:
             dirnames[:] = []
@@ -1779,7 +1820,7 @@ def map_keys_to_files(files, keys):
             covered.add(p)
     return mapping
 
-def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, checkpoint=None, on_tier_start=None, gpu=None, license_key=None):
+def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, checkpoint=None, on_tier_start=None, gpu=None, license_key=None, on_part=None):
     mapping = {}
     remaining = list(files)
     tried_total = 0
@@ -1800,6 +1841,8 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
         if not fresh:
             break
         part = map_keys_to_files(remaining, fresh)
+        if on_part is not None and part:
+            on_part(part)
         covered = set()
         for k, hits in part.items():
             mapping.setdefault(k, [])
@@ -1820,38 +1863,46 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
 # file has its own salt, and every guess costs a 600,000-round PBKDF2 before
 # a single AES block can be tried. In exchange there are no false positives,
 # because the 128-bit tag either matches or it does not. So the search tries
-# a guess against the smallest couple of files, accepts it only on a tag
-# match, and then maps the found key across the rest.
-_GCM_WORKER_PROBES = []
+# a guess against a couple of the smallest files, accepts it only on a tag
+# match, and then maps the found key across the rest. The smallest files are
+# also the likeliest to be partial or damaged, so the bounded tiers move on
+# to the next files when a pair opens to nothing (GCM_ROTATE_FILES).
+_GCM_PROBE_CACHE = collections.OrderedDict()
 
-def gcm_probe_set(files, max_probes=2):
+def gcm_probe_order(files):
+    """GCM-shaped files, smallest first: the order in which they are used
+    as probes."""
     sized = sorted(((file_size(p), p) for p in files), key=lambda t: (t[0] is None, t[0] or 0))
-    out = []
-    for size, p in sized:
-        if not gcm_shaped(size):
-            continue
-        try:
-            with open(long_path(p), 'rb') as fh:
-                data = fh.read()
-        except OSError:
-            continue
-        if len(data) < GCM_MIN_LEN:
-            continue
-        out.append((p, data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:]))
-        if len(out) >= max_probes:
-            break
-    return out
+    return [p for size, p in sized if gcm_shaped(size)]
 
-def _gcm_worker_init(probes):
-    global _GCM_WORKER_PROBES
-    _GCM_WORKER_PROBES = probes
+def _gcm_probe(path):
+    """(salt, iv, body, tag) of a probe file, cached per process so a pool
+    worker reads each probe once rather than once per guess."""
+    hit = _GCM_PROBE_CACHE.get(path)
+    if hit is None:
+        with open(long_path(path), 'rb') as fh:
+            data = fh.read()
+        if len(data) < GCM_MIN_LEN:
+            raise ValueError('too short to be an AES-GCM file')
+        hit = (data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:])
+        _GCM_PROBE_CACHE[path] = hit
+        if len(_GCM_PROBE_CACHE) > GCM_PROBE_CACHE_CAP:
+            _GCM_PROBE_CACHE.popitem(last=False)
+    return hit
+
+def _gcm_worker_init():
     if BACKEND is None:
         _init_backend(False)
 
-def _gcm_worker_chunk(chunk):
+def _gcm_worker_chunk(job):
+    chunk, probe_paths = job
     hits = []
     for cand in chunk:
-        for path, salt, iv, body, tag in _GCM_WORKER_PROBES:
+        for path in probe_paths:
+            try:
+                salt, iv, body, tag = _gcm_probe(path)
+            except (OSError, ValueError):
+                continue
             dk = gcm_kdf(cand, salt)
             ctx = _gcm_new(dk, iv, tag)
             ctx.update(body)
@@ -1882,56 +1933,96 @@ def _make_pool(workers, initializer=None, initargs=()):
     except Exception:
         return None
 
-def sweep_gcm(files, plan, workers=1, limit=None, quiet=False):
-    probes = gcm_probe_set(files)
-    if not probes:
+def _fmt_duration(secs):
+    if secs < 90:
+        return '%.0f seconds' % secs
+    if secs < 5400:
+        return '%.0f minutes' % (secs / 60.0)
+    return '%.1f hours' % (secs / 3600.0)
+
+def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
+    """Returns (found keys, guesses tried). probed, when given, is a set
+    that collects every file a guess was actually checked against."""
+    order = gcm_probe_order(files)
+    if not order:
         return ([], 0)
+    if probed is None:
+        probed = set()
     tiers = [(n, f) for n, f in plan if n in GCM_TIERS]
-    _gcm_worker_init(probes)
-    pool = _make_pool(workers, _gcm_worker_init, (probes,))
-    seen = BoundedSeen()
+    _gcm_worker_init()
+    pool = _make_pool(workers, _gcm_worker_init)
+    first_seen = BoundedSeen()
     tried = 0
     t0 = time.time()
     chunk_size = max(1, workers) * 4
     try:
         for name, factory in tiers:
-            gen = factory()
             tier_start = tried
             found = []
-            while True:
-                chunk = []
-                for cand in gen:
-                    if not cand or cand in seen:
-                        continue
-                    seen.add(cand)
-                    chunk.append(cand)
-                    if len(chunk) >= chunk_size:
-                        break
-                if limit:
-                    chunk = chunk[:max(0, limit - tried)]
-                if not chunk:
+            if name in GCM_ROTATE_TIERS:
+                # Bounded and small, so it is listed once and replayed
+                # against each further pair of files.
+                cands = list(factory())
+                rounds = max(1, (min(len(order), GCM_ROTATE_FILES) + GCM_PROBES - 1) // GCM_PROBES)
+            else:
+                cands = None
+                rounds = 1
+            probes = []
+            for r in range(rounds):
+                probes = order[r * GCM_PROBES:(r + 1) * GCM_PROBES]
+                if not probes:
                     break
-                if pool:
-                    hits = []
-                    for part in pool.map(_gcm_worker_chunk, [chunk[i::workers] for i in range(workers)]):
-                        hits.extend(part)
-                else:
-                    hits = _gcm_worker_chunk(chunk)
-                tried += len(chunk)
-                for cand, _path, salt, dk in hits:
-                    _kdf_remember(cand, salt, dk)
-                    if cand not in found:
-                        found.append(cand)
-                if not quiet:
+                gen = iter(cands) if cands is not None else factory()
+                seen = first_seen if r == 0 else BoundedSeen()
+                if name == 'recovered key variants' and not quiet:
+                    gen = list(gen)
                     rate = tried / max(time.time() - t0, 0.001)
-                    sys.stderr.write('  GCM %-22s %11d tried  %9.1f/s\r' % (name[:22], tried, rate))
-                    sys.stderr.flush()
+                    if tried and rate > 0:
+                        print('  GCM tier %s: %d candidates, roughly %s at this' % (name, len(gen), _fmt_duration(len(gen) / rate)))
+                        print("    machine's rate. Ctrl+C stops the search and still writes every")
+                        print('    file already matched to a key.')
+                    gen = iter(gen)
+                while True:
+                    chunk = []
+                    for cand in gen:
+                        if not cand or cand in seen:
+                            continue
+                        seen.add(cand)
+                        chunk.append(cand)
+                        if len(chunk) >= chunk_size:
+                            break
+                    if limit:
+                        chunk = chunk[:max(0, limit - tried)]
+                    if not chunk:
+                        break
+                    probed.update(probes)
+                    if pool:
+                        hits = []
+                        for part in pool.map(_gcm_worker_chunk, [(chunk[i::workers], probes) for i in range(workers)]):
+                            hits.extend(part)
+                    else:
+                        hits = _gcm_worker_chunk((chunk, probes))
+                    tried += len(chunk)
+                    for cand, _path, salt, dk in hits:
+                        _kdf_remember(cand, salt, dk)
+                        if cand not in found:
+                            found.append(cand)
+                    if not quiet:
+                        rate = tried / max(time.time() - t0, 0.001)
+                        sys.stderr.write('  GCM %-22s %11d tried  %9.1f/s\r' % (name[:22], tried, rate))
+                        sys.stderr.flush()
+                    if found or (limit and tried >= limit):
+                        break
                 if found or (limit and tried >= limit):
                     break
             if not quiet:
                 sys.stderr.write(' ' * 72 + '\r')
                 sys.stderr.flush()
-                print('  GCM tier %-26s %13d candidates  %s' % (name, tried - tier_start, 'HIT' if found else 'no hit'))
+                spread = ''
+                if cands is not None and rounds > 1:
+                    upto = min(len(order), (r + 1) * GCM_PROBES)
+                    spread = '  (tested on %d file(s))' % upto
+                print('  GCM tier %-26s %13d candidates  %s%s' % (name, tried - tier_start, 'HIT' if found else 'no hit', spread))
             if found:
                 return (found, tried)
             if limit and tried >= limit:
@@ -1975,7 +2066,12 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
         mapping[k].sort(key=lambda p: order.get(p, 0))
     return mapping
 
-def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8):
+def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, on_part=None, probed=None, later_plan=None):
+    """on_part(mapping_part) is called as soon as each found key has been
+    mapped, so a caller interrupted later still has every file matched so
+    far. later_plan, when given, replaces plan once a key has opened
+    files, so the files already opened are not held back behind a long
+    search for the stragglers."""
     mapping = {}
     remaining = [f for f in files if gcm_shaped(file_size(f))]
     tried_total = 0
@@ -1987,14 +2083,23 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
             budget = limit - tried_total
             if budget <= 0:
                 break
+        pass_plan = plan
+        if mapping and later_plan is not None:
+            pass_plan = later_plan
         if mapping and (not quiet):
             print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
-        found, tried = sweep_gcm(remaining, plan, workers=workers, limit=budget, quiet=quiet)
+            skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
+            if skipped:
+                print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
+                print('   re-run with --brute to include them)')
+        found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed)
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
         if not fresh:
             break
         part = map_gcm_keys_to_files(remaining, fresh, workers=workers, quiet=quiet)
+        if on_part is not None and part:
+            on_part(part)
         covered = set()
         for k, hits in part.items():
             mapping.setdefault(k, [])
@@ -2355,6 +2460,7 @@ def main(argv=None):
 
     if args.seen_cap:
         globals()['SEEN_CAP'] = max(1000, args.seen_cap)
+    explicit_brute = args.brute
     full_auto = not args.src and (not args.auto)
     if full_auto:
         args.auto = True
@@ -2501,55 +2607,104 @@ def main(argv=None):
         def budget_left():
             return None if args.max_candidates is None else args.max_candidates - tried
         passes = max(1, args.max_passes)
+        probed = set()
+        # Full-auto turns --brute on by itself. There, once a key has opened
+        # files, the slow variant tier is not run for the stragglers, so a
+        # double-click run gets to writing in minutes rather than an hour.
+        gcm_later = None if explicit_brute else [(n, f) for n, f in plan if n != 'recovered key variants']
+        interrupted = False
+
+        def covered_now():
+            out = set()
+            for hits in mapping.values():
+                out.update(hits)
+            return out
         # A GCM file is salt+iv+data+tag, so its length is only a multiple of
         # 16 one time in sixteen; anything else cannot be the original ECB
         # format. Block-aligned files can be either, and are settled below.
         gcm_only = [f for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))]
         ecb_cand = [f for f in files if ecb_shaped(sizes[f])]
-        if gcm_only:
-            if not args.quiet:
-                print('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
-                print('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
-                print('stretch on these, so they get the supplied, recovered and variant keys;')
-                print('the fitted model and structural brute are left to the older files.')
-                if gpu is not None:
-                    print('The GPU is not used for the GCM files.')
-                print()
-            gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes)
-            tried += gtried
-            merge(gmap, 'gcm')
-            aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
-            if gmap and aligned:
+        try:
+            if gcm_only:
                 if not args.quiet:
-                    print('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
-                part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet)
-                merge(part, 'gcm')
-                ecb_cand = [f for f in ecb_cand if f not in file_scheme]
-            if ecb_cand and (not args.quiet):
-                print()
-                print('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
-        if ecb_cand and (budget_left() is None or budget_left() > 0):
-            emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key)
-            tried += etried
-            merge(emap, 'ecb')
+                    print('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
+                    print('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
+                    print('stretch on these, so they get the supplied, recovered and variant keys;')
+                    print('the fitted model and structural brute are left to the older files.')
+                    if gpu is not None:
+                        print('The GPU is not used for the GCM files.')
+                    print()
+                gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
+                tried += gtried
+                merge(gmap, 'gcm')
+                aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
+                if gmap and aligned:
+                    if not args.quiet:
+                        print('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
+                    part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet)
+                    merge(part, 'gcm')
+                    ecb_cand = [f for f in ecb_cand if f not in file_scheme]
+                if ecb_cand and (not args.quiet):
+                    print()
+                    print('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
+            ecb_keys = []
+            quick_plan = [(n, f) for n, f in plan if n in QUICK_TIERS]
+            late_gcm_plan = plan
+            if ecb_cand and len(quick_plan) < len(plan) and (budget_left() is None or budget_left() > 0):
+                # Before any open-ended search, the quick tiers in both
+                # formats. One GCM file in sixteen is block-aligned, and
+                # without this it would wait behind the whole ECB brute for a
+                # recovered key that opens it in seconds.
+                emap, etried, _ = find_all_keys(ecb_cand, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, gpu=gpu, license_key=license_key, on_part=lambda part: merge(part, 'ecb'))
+                tried += etried
+                merge(emap, 'ecb')
+                ecb_keys.extend(emap)
+                done = covered_now()
+                aligned_closed = [f for f in ecb_cand if gcm_shaped(sizes[f]) and f not in done]
+                if aligned_closed and (budget_left() is None or budget_left() > 0):
+                    if not args.quiet:
+                        print('  checking %d block-aligned file(s) as AES-GCM before any brute force:' % len(aligned_closed))
+                    gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
+                    tried += gtried
+                    merge(gmap, 'gcm')
+                done = covered_now()
+                ecb_cand = [f for f in ecb_cand if f not in done]
+                # Every block-aligned file left has had the quick tiers as
+                # GCM already, so only the rest of the plan remains for them.
+                late_gcm_plan = [(n, f) for n, f in plan if n not in QUICK_TIERS]
+            if ecb_cand and (budget_left() is None or budget_left() > 0):
+                emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key, on_part=lambda part: merge(part, 'ecb'))
+                tried += etried
+                merge(emap, 'ecb')
+                ecb_keys.extend(k for k in emap if k not in ecb_keys)
+                leftover = [f for f in eun if gcm_shaped(sizes[f]) and f not in file_scheme]
+            else:
+                leftover = []
             # The same typed key can be reused across both builds, so a key
             # the ECB search found is tried on every GCM file still closed.
-            covered_now = set()
-            for hits in mapping.values():
-                covered_now.update(hits)
-            closed_gcm = [f for f in files if gcm_shaped(sizes[f]) and f not in covered_now]
-            if emap and closed_gcm:
+            done = covered_now()
+            closed_gcm = [f for f in files if gcm_shaped(sizes[f]) and f not in done]
+            if ecb_keys and closed_gcm:
                 if not args.quiet:
                     print('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
-                merge(map_gcm_keys_to_files(closed_gcm, list(emap), workers=workers, quiet=args.quiet), 'gcm')
-            leftover = [f for f in eun if gcm_shaped(sizes[f]) and f not in file_scheme]
+                merge(map_gcm_keys_to_files(closed_gcm, ecb_keys, workers=workers, quiet=args.quiet), 'gcm')
+            leftover = [f for f in leftover if f not in file_scheme]
             if leftover and (budget_left() is None or budget_left() > 0):
                 if not args.quiet:
                     print()
                     print('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
-                gmap, gtried, _ = find_all_gcm_keys(leftover, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes)
+                gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
                 tried += gtried
                 merge(gmap, 'gcm')
+        except KeyboardInterrupt:
+            interrupted = True
+            sys.stderr.write(' ' * 72 + '\r')
+            print()
+            if not mapping:
+                print('Interrupted before any key was found. Nothing was written.')
+                return 130
+            print('Interrupted. Stopping the search and writing the %d file(s) already' % len(covered_now()))
+            print('matched to a key. Run again to keep searching for the rest.')
         covered_all = set()
         for hits in mapping.values():
             covered_all.update(hits)
@@ -2558,6 +2713,13 @@ def main(argv=None):
             print()
             print('No key opened any file after %d candidate(s).' % tried)
             print()
+            n_gcm = sum((1 for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))))
+            if probed and len(probed) < n_gcm:
+                print('The AES-GCM guesses were checked against %d of the %d AES-GCM' % (len(probed), n_gcm))
+                print('file(s), the smallest ones. Small files are the likeliest to be')
+                print('partial or damaged copies. If you know some files are intact,')
+                print('copy a few of them to a folder and run with --in on that folder.')
+                print()
             any_ecb = any((ecb_shaped(sizes[f]) for f in files))
             if not args.brute:
                 print('Next step: re-run with --brute to sweep modelled candidates.')
@@ -2629,6 +2791,10 @@ def main(argv=None):
     if not forced:
         for key_string, hits in mapping.items():
             for path in hits[:6]:
+                if file_scheme.get(path) == 'gcm':
+                    # The full tag was verified when the key was mapped.
+                    proven.add(key_string)
+                    break
                 _, ver, _ = decrypt_file(path, key_string, verify=True, scheme=file_scheme.get(path, 'ecb'))
                 if ver:
                     proven.add(key_string)
@@ -2639,53 +2805,77 @@ def main(argv=None):
                 continue
             handled.add(path)
             scheme = 'auto' if forced else file_scheme.get(path, 'ecb')
-            pt, verified, err = decrypt_file(path, key_string, verify=not forced, scheme=scheme)
-            if pt is None:
-                print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
-                failed += 1
-                continue
-            allow = args.keep_unverified or (key_string in proven and (not args.strict))
-            if not verified and (not forced) and (not allow):
-                print('  FAIL   %s  (%s, not written, use --keep-unverified)' % (os.path.basename(path), err or 'unverified'))
-                failed += 1
-                continue
-            label, canon = identify(pt[:16])
-            dest = mirrored_path(args.dst, path, flat=args.flat)
-            fix = plan_extension_fix(dest, pt[:_DETECT_HEAD]) if args.fix_ext else None
-            if fix:
-                dest = os.path.splitext(dest)[0] + '.' + fix['new']
-            if not verified and (not forced):
-                dest += '.UNVERIFIED'
-            tmp = None
+            base = mirrored_path(args.dst, path, flat=args.flat)
+            tmp = base + '.part'
+            pt = None
             try:
-                os.makedirs(long_path(os.path.dirname(dest) or '.'), exist_ok=True)
-                if not args.overwrite:
-                    dest = unique_path(dest)
-                tmp = dest + '.part'
-                with open(long_path(tmp), 'wb') as fh:
-                    fh.write(pt)
-                os.replace(long_path(tmp), long_path(dest))
-            except OSError as e:
-                print('  FAIL   %s  (cannot write: %s)' % (os.path.basename(path), e))
-                failed += 1
-                if tmp:
+                if scheme == 'gcm':
+                    # Streamed straight to disk, so a multi-gigabyte video
+                    # never has to fit in memory. The .part file only becomes
+                    # the recovered file once the tag has verified.
                     try:
-                        os.remove(long_path(tmp))
-                    except OSError:
-                        pass
-                continue
+                        os.makedirs(long_path(os.path.dirname(base) or '.'), exist_ok=True)
+                        with open(long_path(tmp), 'wb') as fh:
+                            err = gcm_decrypt_to(path, key_string, fh)
+                    except OSError as e:
+                        err = 'cannot write: %s' % e
+                    if err is not None:
+                        _remove_quietly(tmp)
+                        print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
+                        failed += 1
+                        continue
+                    verified = True
+                    out_len = os.path.getsize(long_path(tmp))
+                    with open(long_path(tmp), 'rb') as fh:
+                        head = fh.read(_DETECT_HEAD)
+                else:
+                    pt, verified, err = decrypt_file(path, key_string, verify=not forced, scheme=scheme)
+                    if pt is None:
+                        print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
+                        failed += 1
+                        continue
+                    allow = args.keep_unverified or (key_string in proven and (not args.strict))
+                    if not verified and (not forced) and (not allow):
+                        print('  FAIL   %s  (%s, not written, use --keep-unverified)' % (os.path.basename(path), err or 'unverified'))
+                        failed += 1
+                        continue
+                    out_len = len(pt)
+                    head = pt[:_DETECT_HEAD]
+                label, canon = identify(head[:16])
+                dest = base
+                fix = plan_extension_fix(dest, head) if args.fix_ext else None
+                if fix:
+                    dest = os.path.splitext(dest)[0] + '.' + fix['new']
+                if not verified and (not forced):
+                    dest += '.UNVERIFIED'
+                try:
+                    os.makedirs(long_path(os.path.dirname(dest) or '.'), exist_ok=True)
+                    if not args.overwrite:
+                        dest = unique_path(dest)
+                    if pt is not None:
+                        with open(long_path(tmp), 'wb') as fh:
+                            fh.write(pt)
+                    os.replace(long_path(tmp), long_path(dest))
+                except OSError as e:
+                    print('  FAIL   %s  (cannot write: %s)' % (os.path.basename(path), e))
+                    failed += 1
+                    _remove_quietly(tmp)
+                    continue
+            except KeyboardInterrupt:
+                _remove_quietly(tmp)
+                raise
             if verified:
                 recovered += 1
                 if not args.quiet:
-                    print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], len(pt), (label or 'unknown type') + ('  [GCM, tag verified]' if scheme == 'gcm' else '')))
+                    print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, (label or 'unknown type') + ('  [GCM, tag verified]' if scheme == 'gcm' else '')))
             elif forced:
                 unverified += 1
                 if not args.quiet:
-                    print('  FORCED %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], len(pt), label or 'unrecognised type, not structurally checked'))
+                    print('  FORCED %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, label or 'unrecognised type, not structurally checked'))
             else:
                 unverified += 1
                 if not args.quiet:
-                    print('  PROVEN %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], len(pt), 'key proven on this machine, structure not checked'))
+                    print('  PROVEN %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, 'key proven on this machine, structure not checked'))
             if fix:
                 ext_fixed += 1
                 ext_fix_log.append((os.path.basename(dest), fix['old'], fix['new'], fix['category']))
@@ -2729,12 +2919,49 @@ def main(argv=None):
     print()
     print('Rho-9 Systems. Your first line of unusual defense.')
     return 0 if recovered or unverified else 3
+
+def alone_on_console(attached, frozen):
+    """True when nothing but this program is attached to its console, which
+    is what a double-click from Explorer looks like: Windows opened the
+    window for us and closes it the moment we exit. A one-file PyInstaller
+    build is a bootloader plus a child, so it counts as two. From cmd or
+    PowerShell the shell is attached as well."""
+    return 0 < attached <= (2 if frozen else 1)
+
+def launched_by_double_click():
+    if not WINDOWS:
+        return False
+    try:
+        import ctypes
+        buf = (ctypes.c_uint32 * 8)()
+        attached = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
+    except Exception:
+        return False
+    return alone_on_console(attached, bool(getattr(sys, 'frozen', False)))
+
+def pause_before_close():
+    try:
+        input('\nPress Enter to close this window.')
+    except (EOFError, KeyboardInterrupt):
+        pass
+
 if __name__ == '__main__':
     import multiprocessing
     multiprocessing.freeze_support()
     setup_console()
+    # Checked before any worker processes exist, since they share the console.
+    hold_window = launched_by_double_click()
     try:
-        sys.exit(main())
+        code = main()
     except KeyboardInterrupt:
         sys.stderr.write('\ninterrupted, nothing left half written\n')
-        sys.exit(130)
+        code = 130
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print('\nunmicro stopped on an unexpected error. Please send the text above')
+        print('to %s and mention Chattering Magpies.' % LICENSE_CONTACT)
+        code = 1
+    if hold_window:
+        pause_before_close()
+    sys.exit(code)

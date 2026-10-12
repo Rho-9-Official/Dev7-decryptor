@@ -2,6 +2,50 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.8.2
+
+Edge-case fixes. A double-click (full-auto) run could report 0 hits on files
+the recovered keys open; this release fixes that and the other cases found
+alongside it. Same license as 3.8.1.
+
+### Fixed
+- **Two bad files no longer hide a working key.** The GCM search checked
+  every guess against only the two smallest GCM files. If both were partial
+  copies from an interrupted run, or under another key, nothing matched and
+  the run reported no key at all. The supplied and recovered keys now move on
+  to the next two files, through up to 16, before giving up.
+- **`--auto` searched past user folders.** `Dev`, `Run`, `Recovery`,
+  `Windows`, `Snap`, `Sys` and `Proc` were skipped at any depth, so a
+  victim's `Documents\Dev` was never searched. They are now skipped only at
+  the top of a scan root (`C:\Windows`, `/proc`). The extension check is also
+  no longer case-sensitive, so `.CRYPTEDMICRO` is found.
+- **Block-aligned GCM files waited behind the ECB brute.** One GCM file in
+  sixteen is a whole number of AES blocks. With no other GCM file to find the
+  key on, these went through the full ECB brute force before a recovered key
+  was tried on them as GCM. The quick key sources now run in both formats
+  before any open-ended search.
+- **Double-click window closed on exit.** Launched from Explorer, the window
+  now stays open until Enter is pressed, including after an unexpected error.
+- **Full-auto held opened files back for an hour.** Once a key had opened
+  files, the files left over got the full 15,000-candidate variant tier
+  before anything was written. In full-auto that second sweep now skips the
+  variants (`--brute` given explicitly still runs them), and a time estimate
+  is printed before the variant tier starts.
+- **Ctrl+C lost everything.** Interrupting the key search now writes every
+  file already matched to a key, then stops.
+- **Misleading no-key advice.** When nothing opens, the output now says how
+  many of the GCM files were actually tested, and suggests running `--in` on
+  a folder of known-intact files.
+- **GCM output held in memory.** GCM files are now decrypted straight to a
+  temporary `.part` file that only becomes the recovered file once the tag
+  verifies, so very large files no longer have to fit in RAM. ECB output is
+  unchanged (its structural check needs the whole plaintext).
+- **README:** `--dumb-brute` starts at 1 character, not 3.
+
+### Added
+- `tests/test_edge_cases.py`: regression tests for each of the above, run in
+  CI. The end-to-end tests run only when `UNMICRO_LICENSE` is set.
+
 ## 3.8.1
 
 First published build of the 3.8 changes. The `v3.8` tag was created from an
