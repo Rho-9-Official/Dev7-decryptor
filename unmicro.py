@@ -930,6 +930,134 @@ def ecb_shaped(size):
 def gcm_shaped(size):
     return size is not None and size >= GCM_MIN_LEN
 
+# Damaged-copy screen. The malware writes a new <name>.cryptedmicro and then
+# deletes the original, so a run that was cut short leaves stubs behind: empty
+# files, a few stray bytes, files extended with zeros, files cut mid-write.
+# These are screened out before any probe is chosen, because a probe that can
+# never open under the right key hides that key from the whole sweep.
+DAMAGE_ZERO_RUN = 32
+DAMAGE_REPORT = 'corrupted-files.txt'
+DAMAGE_LABELS = {
+    'unreadable': 'cannot be read',
+    'empty': 'zero-byte stub',
+    'stub': 'too short or misshapen to be either format',
+    'zero-head': 'first block is all zero bytes, never written',
+    'zero-tail': 'ends in a run of zero bytes, extended but not fully written',
+    'truncated': 'first block opens under a known key but the file does not verify',
+}
+
+def classify_damage(path, size):
+    """Key-free structural screen for a damaged .cryptedmicro copy.
+
+    Returns None when the file could be a whole ciphertext, else
+    (code, detail). Every rule here is exact or near impossible to trip by
+    chance: AES output is indistinguishable from random, so a 16 byte block
+    or a 32 byte run of zeros has odds of 2^-128 or better of turning up in
+    a genuine file. A file that is damaged but still looks whole (cut at an
+    odd length above 43 bytes, say) cannot be told from a good one without
+    a key; diagnose_damaged() picks those up once a key is known."""
+    if size is None:
+        return ('unreadable', 'size could not be read')
+    if size == 0:
+        return ('empty', 'file is 0 bytes')
+    if not ecb_shaped(size) and not gcm_shaped(size):
+        return ('stub', 'length %d is not a multiple of 16 and is under the %d byte AES-GCM minimum' % (size, GCM_MIN_LEN))
+    try:
+        with open(long_path(path), 'rb') as fh:
+            head = _read_exact(fh, 16)
+            tail = b''
+            if size > DAMAGE_ZERO_RUN:
+                fh.seek(size - DAMAGE_ZERO_RUN)
+                tail = _read_exact(fh, DAMAGE_ZERO_RUN)
+    except OSError as e:
+        return ('unreadable', 'cannot read: %s' % e)
+    if len(head) == 16 and head == b'\x00' * 16:
+        return ('zero-head', 'first 16 bytes are all zero')
+    if len(tail) == DAMAGE_ZERO_RUN and tail == b'\x00' * DAMAGE_ZERO_RUN:
+        return ('zero-tail', 'last %d bytes are all zero' % DAMAGE_ZERO_RUN)
+    return None
+
+def split_damaged(files, sizes):
+    """(whole-looking files, [(path, size, code, detail)]) with order kept."""
+    good, bad = [], []
+    for f in files:
+        verdict = classify_damage(f, sizes.get(f))
+        if verdict is None:
+            good.append(f)
+        else:
+            bad.append((f, sizes.get(f), verdict[0], verdict[1]))
+    return (good, bad)
+
+def diagnose_damaged(paths, keys, limit_keys=16):
+    """Second stage, run once keys are known. For files no key opened, a
+    file whose first block decrypts to a recognised file signature under a
+    known ECB key was a real encryption that was cut short or damaged,
+    rather than a file under some key we have not found. Returns
+    [(path, size, 'truncated', detail)]."""
+    if _dec_blocks is None:
+        _init_backend()
+    found = []
+    for p in paths:
+        try:
+            with open(long_path(p), 'rb') as fh:
+                first = _read_exact(fh, 16)
+        except OSError:
+            continue
+        if len(first) < 16:
+            continue
+        for k in list(keys)[:limit_keys]:
+            block = _dec_blocks(key_bytes(k), first)
+            # Three signature bytes or more: a stray two byte match (BM, MZ)
+            # would turn up by chance across thousands of unrelated files.
+            label = next((lab for off, magic, lab, _ in SIGNATURES if len(magic) >= 3 and block[off:off + len(magic)] == magic), None)
+            if label:
+                found.append((p, file_size(p), 'truncated', 'first block opens as %s under key %r, but the whole file does not verify' % (label, k)))
+                break
+    return found
+
+def write_damage_report(dst, damaged, quiet=False):
+    """Write the list of excluded files next to the recovered output. Only
+    ever creates the report; encrypted originals are not touched."""
+    if not damaged or not dst:
+        return None
+    path = os.path.join(dst, DAMAGE_REPORT)
+    lines = ['Dev7 / Micro damaged .cryptedmicro files excluded from the key search.',
+             'These look like copies left by an interrupted encryption run. Keep them:',
+             'a copy cut short can still hold a recoverable start of the file.',
+             '',
+             '%-10s %12s  %s' % ('reason', 'bytes', 'path')]
+    for p, size, code, detail in damaged:
+        lines.append('%-10s %12s  %s' % (code, '?' if size is None else size, p))
+        lines.append('%s%s' % (' ' * 24, detail))
+    try:
+        os.makedirs(long_path(dst), exist_ok=True)
+        with open(long_path(path), 'w', encoding='utf-8', errors='replace') as fh:
+            fh.write('\n'.join(lines) + '\n')
+    except OSError as e:
+        if not quiet:
+            print('Could not write %s: %s' % (DAMAGE_REPORT, e))
+        return None
+    return path
+
+def print_damage_summary(damaged, report=None, limit=10):
+    if not damaged:
+        return
+    counts = collections.OrderedDict()
+    for _, _, code, _ in damaged:
+        counts[code] = counts.get(code, 0) + 1
+    print('Damaged copies excluded from the key search: %d' % len(damaged))
+    for code, n in counts.items():
+        print('    %-10s %6d  %s' % (code, n, DAMAGE_LABELS.get(code, '')))
+    for p, size, code, _ in damaged[:limit]:
+        print('      %s  (%s bytes)' % (p, '?' if size is None else size))
+    if len(damaged) > limit:
+        print('      ... and %d more' % (len(damaged) - limit))
+    if report:
+        print('Full list: %s' % report)
+    print('These are not deleted or changed. They look like leftovers of an interrupted')
+    print('encryption run (the malware writes a new copy, then deletes the original).')
+    print()
+
 _KDF_CACHE = collections.OrderedDict()
 
 def _gcm_password(key_string):
@@ -2519,6 +2647,18 @@ def main(argv=None):
         with open(long_path(args.wordlist), 'r', encoding='utf-8', errors='replace') as fh:
             wordlist = [ln.rstrip('\r\n') for ln in fh if ln.strip()]
     sizes = {f: file_size(f) for f in files}
+    # Interrupted encryption runs leave stubs and cut-short copies. They are
+    # set aside before any probe is chosen so they cannot hide a key.
+    files, damaged = split_damaged(files, sizes)
+    if damaged:
+        damage_report = None if args.identify else write_damage_report(args.dst, damaged, quiet=args.quiet)
+        if not args.quiet or not files:
+            print_damage_summary(damaged, damage_report)
+    if not files:
+        print('Every %s file found is a damaged copy, so there is nothing to try a key on.' % EXT)
+        print('Keep them. If the originals were deleted after encryption, shadow copies,')
+        print('undelete and file carving are still worth trying on this machine.')
+        return 2
     file_scheme = {}
     forced = False
     if args.force and len(args.key) == 1 and (not args.brute) and (not args.dumb_brute) and (not wordlist) and (not args.scavenge):
@@ -2701,7 +2841,7 @@ def main(argv=None):
             sys.stderr.write(' ' * 72 + '\r')
             print()
             if not mapping:
-                print('Interrupted before any key was found. Nothing was written.')
+                print('Interrupted before any key was found. No files were recovered.')
                 return 130
             print('Interrupted. Stopping the search and writing the %d file(s) already' % len(covered_now()))
             print('matched to a key. Run again to keep searching for the rest.')
@@ -2709,6 +2849,19 @@ def main(argv=None):
         for hits in mapping.values():
             covered_all.update(hits)
         unmatched = [f for f in files if f not in covered_all]
+        if unmatched and mapping:
+            cut = diagnose_damaged(unmatched, list(mapping))
+            if cut:
+                damaged.extend(cut)
+                cut_paths = set(c[0] for c in cut)
+                files = [f for f in files if f not in cut_paths]
+                unmatched = [f for f in unmatched if f not in cut_paths]
+                write_damage_report(None if args.identify else args.dst, damaged, quiet=args.quiet)
+                if not args.quiet:
+                    print()
+                    print('%d more file(s) are real encryptions that were cut short or damaged' % len(cut))
+                    print('(the first block opens under a key found here, the whole file does')
+                    print('not). Excluded and listed in %s.' % DAMAGE_REPORT)
         if not mapping:
             print()
             print('No key opened any file after %d candidate(s).' % tried)
@@ -2889,6 +3042,8 @@ def main(argv=None):
         print('Written unverified     : %d%s' % (unverified, '  (forced key, structure not checked)' if forced else '  (proven key, structure not checked, .UNVERIFIED suffix)'))
     if failed:
         print('Failed                 : %d' % failed)
+    if damaged:
+        print('Damaged, excluded      : %d  (listed in %s)' % (len(damaged), os.path.join(args.dst, DAMAGE_REPORT)))
     if ext_fixed:
         print('Extension swaps fixed  : %d' % ext_fixed)
     if leftover:

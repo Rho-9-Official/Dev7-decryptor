@@ -258,5 +258,105 @@ class EndToEnd(Base):
         self.assertIn('checked against %d of the %d' % (unmicro.GCM_ROTATE_FILES, n), out)
 
 
+class DamagedCopies(Base):
+    """Interrupted runs leave stubs and cut-short copies. They are screened
+    out before probes are chosen and listed in a report."""
+
+    def write(self, name, data):
+        path = self.p(name)
+        with open(path, 'wb') as fh:
+            fh.write(data)
+        return path
+
+    def read(self, path):
+        with open(path, 'rb') as fh:
+            return fh.read()
+
+    def sizes(self, files):
+        return {f: unmicro.file_size(f) for f in files}
+
+    def screen(self, files):
+        return unmicro.split_damaged(files, self.sizes(files))
+
+    def test_empty_and_stub_lengths_flagged(self):
+        files = [self.write('empty.jpg.cryptedmicro', b''), self.write('three.jpg.cryptedmicro', os.urandom(3)),
+                 self.write('odd30.jpg.cryptedmicro', os.urandom(30)), self.write('odd43.jpg.cryptedmicro', os.urandom(43))]
+        good, bad = self.screen(files)
+        self.assertEqual(good, [])
+        self.assertEqual([b[2] for b in bad], ['empty', 'stub', 'stub', 'stub'])
+
+    def test_zero_filled_flagged(self):
+        files = [self.write('zeros.jpg.cryptedmicro', b'\x00' * 4096),
+                 self.write('zerotail.jpg.cryptedmicro', os.urandom(2000) + b'\x00' * 64)]
+        good, bad = self.screen(files)
+        self.assertEqual(good, [])
+        self.assertEqual([b[2] for b in bad], ['zero-head', 'zero-tail'])
+
+    def test_whole_looking_files_pass(self):
+        files = self.good_gcm(3)
+        make_ecb(self.p('old.jpg.cryptedmicro'), KEY, jpeg(4000))
+        files.append(self.p('old.jpg.cryptedmicro'))
+        # Smallest legal ECB (one block) and smallest legal GCM (44 bytes).
+        files.append(self.write('oneblock.jpg.cryptedmicro', os.urandom(16)))
+        files.append(self.write('mingcm.jpg.cryptedmicro', os.urandom(44)))
+        good, bad = self.screen(files)
+        self.assertEqual(sorted(good), sorted(files))
+        self.assertEqual(bad, [])
+
+    def test_stubs_never_become_probes(self):
+        good = self.good_gcm()
+        stubs = [self.write('s%d.jpg.cryptedmicro' % i, b'\x00' * (100 + i)) for i in range(5)]
+        files = sorted(good + stubs)
+        kept, bad = self.screen(files)
+        self.assertEqual(len(bad), 5)
+        self.assertEqual(sorted(unmicro.gcm_probe_order(kept)), sorted(good))
+        mapping, _, remaining = unmicro.find_all_gcm_keys(kept, supplied('nope', KEY), quiet=True)
+        self.assertEqual(sorted(mapping.get(KEY, [])), sorted(good))
+        self.assertEqual(remaining, [])
+
+    def test_many_stubs_do_not_break_ecb_probe_choice(self):
+        good = []
+        for i in range(3):
+            path = self.p('good%d.jpg.cryptedmicro' % i)
+            make_ecb(path, KEY, jpeg(3000 + i * 160))
+            good.append(path)
+        stubs = [self.write('z%02d.jpg.cryptedmicro' % i, b'\x00' * 16) for i in range(40)]
+        kept, bad = self.screen(sorted(good + stubs))
+        self.assertEqual(len(bad), 40)
+        probes = unmicro.probe_set(kept)
+        self.assertEqual(sorted(p[1] for p in probes), sorted(good))
+        # Before the screen, the zero-block stubs were the biggest group and
+        # so the first probe.
+        raw = unmicro.probe_set(sorted(good + stubs))
+        self.assertIn(stubs[0], [p[1] for p in raw] + stubs)
+        self.assertTrue(any(p[1] in stubs for p in raw))
+
+    def test_diagnose_finds_cut_short_real_encryption(self):
+        make_ecb(self.p('whole.jpg.cryptedmicro'), KEY, jpeg(4000))
+        with open(self.p('whole.jpg.cryptedmicro'), 'rb') as fh:
+            data = fh.read()
+        cut = self.write('cut.jpg.cryptedmicro', data[:1003])
+        foreign = self.write('foreign.jpg.cryptedmicro', os.urandom(1003))
+        found = unmicro.diagnose_damaged([cut, foreign], [KEY])
+        self.assertEqual([f[0] for f in found], [cut])
+        self.assertEqual(found[0][2], 'truncated')
+
+    def test_report_written_and_originals_untouched(self):
+        a = self.write('empty.jpg.cryptedmicro', b'')
+        b = self.write('zeros.jpg.cryptedmicro', b'\x00' * 64)
+        before = [self.read(a), self.read(b)]
+        _, bad = self.screen([a, b])
+        out = os.path.join(self.dir, 'out')
+        path = unmicro.write_damage_report(out, bad, quiet=True)
+        self.assertEqual(os.path.basename(path), unmicro.DAMAGE_REPORT)
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+        self.assertIn(a, text)
+        self.assertIn(b, text)
+        self.assertEqual(before, [self.read(a), self.read(b)])
+        self.assertIsNone(unmicro.write_damage_report(out, [], quiet=True))
+        self.assertIsNone(unmicro.write_damage_report(None, bad, quiet=True))
+
+
 if __name__ == '__main__':
     unittest.main()

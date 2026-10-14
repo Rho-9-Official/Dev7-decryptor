@@ -2,6 +2,29 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## Unreleased
+
+Damaged copies from interrupted encryption runs no longer break the file
+picker. The malware writes a new `.cryptedmicro` copy and then deletes the
+original, so a run that was cut short leaves stubs and half-written files.
+On a machine with many of them, the smallest files were chosen as probes,
+and a probe that can never open hides the key from the whole sweep.
+
+### Added
+- **Damaged-copy screen.** Before any probe is chosen, files that cannot be a
+  whole ciphertext are set aside: zero-byte files, lengths that are neither a
+  whole number of AES blocks nor long enough for AES-GCM (under 44 bytes),
+  files whose first block is all zeros, and files ending in a run of 32 or
+  more zero bytes. These checks are exact or near impossible to trip by
+  chance on real ciphertext.
+- **Cut-short detection once a key is known.** A file no key opened, whose
+  first block decrypts to a recognised file signature (three bytes or more)
+  under a key found on the same machine, is a real encryption that was cut
+  short. It is excluded and reported rather than counted as "no key found".
+- **`corrupted-files.txt`** is written to the output folder, listing every
+  excluded file with its size and the reason. Nothing is deleted or changed.
+  With `--identify`, nothing is written and the list is only printed.
+
 ## 3.8.2
 
 Edge-case fixes. A double-click (full-auto) run could report 0 hits on files
