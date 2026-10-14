@@ -2606,6 +2606,13 @@ def plan_extension_fix(name, head):
     return {'old': cur, 'new': ext, 'category': cat}
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+        # No arguments on a terminal: ask what to do instead of guessing.
+        if not argv and ui_is_interactive():
+            argv = run_ui()
+            if argv is None:
+                return 0
     ap = argparse.ArgumentParser(prog='unmicro.py', description='Decrypt files encrypted by the Dev7 / Micro ransomware (.cryptedmicro). Your encrypted files are never modified.', formatter_class=argparse.RawDescriptionHelpFormatter)
     g_src = ap.add_argument_group('finding the files')
     g_src.add_argument('--in', dest='src', help='encrypted file, or directory containing .cryptedmicro files')
@@ -2614,6 +2621,7 @@ def main(argv=None):
     g_src.add_argument('--no-prune', action='store_true', help='do not skip system folders while scanning, much slower')
     g_src.add_argument('--recursive', action='store_true', help='walk subdirectories of --in')
     g_src.add_argument('--max-files', type=int, help='stop scanning after this many encrypted files')
+    g_src.add_argument('--no-ui', dest='no_ui', action='store_true', help='skip the interactive menu that opens when the tool is run with no arguments on a terminal. With nothing else given, this runs the old full-auto search. Setting the %s environment variable does the same' % UI_NO_UI_ENV)
     g_lic = ap.add_argument_group('license (per-build)')
     g_lic.add_argument('--license', dest='license', metavar='KEY', help="license key for this build. If omitted, the UNMICRO_LICENSE environment variable is used, else the tool prompts. Contact " + LICENSE_CONTACT + " for a key if you do not have one; mention 'Chattering Magpies'.")
     g_lic.add_argument('--self-test', dest='self_test', action='store_true', help='run a quick self-test (sealed-blob integrity, AES back end). Does not need a license. Used by CI')
@@ -3180,6 +3188,494 @@ def main(argv=None):
     print()
     print('Rho-9 Systems. Your first line of unusual defense.')
     return 0 if recovered or unverified else 3
+
+# ---------------------------------------------------------------------------
+# Interactive setup. Run with no arguments on a terminal, the tool asks what
+# to do and builds the argument list that main() would otherwise have been
+# given, so none of the recovery logic is duplicated here. Plain text and
+# numbered menus only: it has to work on a bare Python, in Termux and in the
+# frozen Windows binary. Pass --no-ui, or set UNMICRO_NO_UI, to skip it.
+# ---------------------------------------------------------------------------
+UI_NO_UI_ENV = 'UNMICRO_NO_UI'
+UI_RULE = '-' * 60
+UI_PROGRESS_FILE = 'unmicro-progress.json'
+
+class UiBack(Exception):
+    pass
+
+class UiQuit(Exception):
+    pass
+
+def _ui_input(prompt):
+    return input(prompt)
+
+def ui_is_interactive():
+    if os.environ.get(UI_NO_UI_ENV):
+        return False
+    try:
+        return bool(sys.stdin and sys.stdout and sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+def _ui_read(prompt):
+    try:
+        raw = _ui_input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise UiQuit()
+    raw = raw.strip()
+    if raw.lower() in ('q', 'quit', 'exit'):
+        raise UiQuit()
+    return raw
+
+def parse_selection(text, count):
+    """Parse a multiple choice answer into a list of choice numbers.
+
+    '1+2+4' is the intended form; commas, spaces and ranges ('2-4') are
+    accepted too. 'a' selects everything and 'n' nothing. Raises ValueError
+    with a plain message on anything else. Order is kept, duplicates drop."""
+    t = text.strip().lower()
+    if t in ('a', 'all'):
+        return list(range(1, count + 1))
+    if t in ('n', 'none'):
+        return []
+    out = []
+    for part in re.split(r'[+,\s]+', t):
+        if not part:
+            continue
+        m = re.fullmatch(r'(\d+)-(\d+)', part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                raise ValueError('"%s" is a backwards range' % part)
+            nums = range(lo, hi + 1)
+        elif part.isdigit():
+            nums = [int(part)]
+        else:
+            raise ValueError('"%s" is not a number' % part)
+        for n in nums:
+            if n < 1 or n > count:
+                raise ValueError('%d is not one of the choices (1 to %d)' % (n, count))
+            if n not in out:
+                out.append(n)
+    return out
+
+def _ui_show_options(options):
+    for i, opt in enumerate(options, 1):
+        label, desc = opt[0], opt[1] if len(opt) > 1 else ''
+        print('  %d  %s - %s' % (i, label, desc) if desc else '  %d  %s' % (i, label))
+
+def ui_choose_one(title, options, default=1, help_text=None):
+    print()
+    print(title)
+    _ui_show_options(options)
+    while True:
+        raw = _ui_read('Choose [%d]: ' % default)
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print(help_text or 'Type the number of one choice and press Enter.')
+            continue
+        if not raw:
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        print('Please type a number from 1 to %d.' % len(options))
+
+def ui_choose_many(title, options, default=(), help_text=None):
+    print()
+    print(title)
+    _ui_show_options(options)
+    shown = '+'.join(str(n) for n in default) if default else 'none'
+    while True:
+        raw = _ui_read('Choose, e.g. 1+3 (Enter = %s, a = all, n = none): ' % shown)
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print(help_text or 'Type the numbers you want joined with +, for example 1+2+4.')
+            continue
+        if not raw:
+            return list(default)
+        try:
+            return parse_selection(raw, len(options))
+        except ValueError as e:
+            print('%s. Try again.' % e)
+
+def _ui_clean_path(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in '"\'':
+        raw = raw[1:-1]
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(raw.strip())))
+
+def ui_ask_path(prompt, kind='any', default=None, allow_blank=False):
+    """Ask for a path. kind: 'dir', 'file' or 'any'. Quotes from drag and
+    drop are stripped. With allow_blank, Enter returns None."""
+    while True:
+        suffix = ' [%s]' % default if default else ''
+        raw = _ui_read('%s%s: ' % (prompt, suffix))
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print('Type or paste a path. Dragging the item into this window usually pastes it.')
+            continue
+        if not raw:
+            if default:
+                return default
+            if allow_blank:
+                return None
+            print('A path is needed here.')
+            continue
+        path = _ui_clean_path(raw)
+        if kind == 'dir' and not os.path.isdir(path):
+            print('That is not a folder that exists: %s' % path)
+        elif kind == 'file' and not os.path.isfile(path):
+            print('That is not a file that exists: %s' % path)
+        elif kind == 'any' and not os.path.exists(path):
+            print('That does not exist: %s' % path)
+        else:
+            return path
+
+def ui_ask_text(prompt, default=None, allow_blank=False):
+    while True:
+        suffix = ' [%s]' % default if default else ''
+        raw = _ui_read('%s%s: ' % (prompt, suffix))
+        if raw.lower() in ('b', 'back'):
+            raise UiBack()
+        if raw:
+            return raw
+        if default:
+            return default
+        if allow_blank:
+            return None
+        print('Something needs to be typed here.')
+
+def ui_new_state():
+    return {'where': 'machine', 'paths': [], 'level': 'standard', 'keys': [], 'wordlist': None, 'scavenge': [],
+            'model': False, 'structural': False, 'deep': False, 'gpu': False, 'checkpoint': None,
+            'workers': None, 'flat': False, 'overwrite': False, 'keep_unverified': False, 'strict': False,
+            'no_fix_ext': False, 'identify': False, 'out': None}
+
+def ui_build_argv(st):
+    """The argument list main() would take for the answers in st."""
+    a = []
+    where = st['where']
+    paths = st.get('paths') or []
+    if where == 'file' and paths:
+        a += ['--in', paths[0]]
+    elif where == 'folders' and len(paths) == 1:
+        a += ['--in', paths[0], '--recursive']
+    elif where == 'folders' and paths:
+        a += ['--auto']
+        for p in paths:
+            a += ['--scan-root', p]
+    else:
+        a += ['--auto']
+    level = st['level']
+    model, structural, deep, checkpoint = st['model'], st['structural'], st['deep'], st['checkpoint']
+    if level == 'standard':
+        model = True
+    elif level == 'thorough':
+        model = structural = True
+        checkpoint = checkpoint or UI_PROGRESS_FILE
+    if level != 'custom':
+        deep = False
+    if deep:
+        model = True
+    for k in st['keys'] if level == 'custom' else []:
+        a += ['--key', k]
+    if level == 'custom' and st['wordlist']:
+        a += ['--wordlist', st['wordlist']]
+    for p in st['scavenge'] if level == 'custom' else []:
+        a += ['--scavenge', p]
+    if model:
+        a.append('--brute')
+    if structural:
+        a.append('--dumb-brute')
+    if deep:
+        a.append('--deep')
+    if st['gpu']:
+        a.append('--gpu')
+    if checkpoint:
+        a += ['--checkpoint', checkpoint]
+    if st['workers']:
+        a += ['--workers', str(st['workers'])]
+    for flag, key in (('--flat', 'flat'), ('--overwrite', 'overwrite'), ('--keep-unverified', 'keep_unverified'), ('--strict', 'strict'), ('--no-fix-ext', 'no_fix_ext')):
+        if st[key]:
+            a.append(flag)
+    if st['identify']:
+        a.append('--identify')
+    elif st['out'] and st['out'] != DEFAULT_OUT_DIR:
+        a += ['--out', st['out']]
+    return a
+
+def ui_command_line(argv):
+    prog = os.path.basename(sys.executable) if getattr(sys, 'frozen', False) else 'unmicro.py'
+    if WINDOWS:
+        import subprocess
+        return subprocess.list2cmdline([prog] + list(argv))
+    import shlex
+    return ' '.join([prog] + [shlex.quote(x) for x in argv])
+
+def _ui_free_bytes(path):
+    import shutil
+    probe = os.path.abspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free
+    except Exception:
+        return None
+
+def _ui_human_bytes(n):
+    n = float(n)
+    for unit in ('bytes', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return '%d %s' % (n, unit) if unit == 'bytes' else '%.1f %s' % (n, unit)
+        n /= 1024.0
+
+def ui_preview(st):
+    """Print what the chosen places hold. Searching the whole machine is not
+    done here: it can take a long time and run does it anyway."""
+    if st['where'] == 'machine':
+        print('The whole machine will be searched when you run it. That can take a while.')
+        return
+    files = []
+    for p in st['paths']:
+        try:
+            files += collect(p, True)
+        except OSError:
+            pass
+    files = sorted(set(files))
+    sizes = {f: file_size(f) for f in files}
+    good, bad = split_damaged(files, sizes)
+    total = sum((sizes[f] or 0) for f in good)
+    print('Found %d encrypted file(s), %s in total.' % (len(files), _ui_human_bytes(sum((s or 0) for s in sizes.values()))))
+    if bad:
+        print('%d of them %s damaged (empty, cut short or zero-filled) and will be set aside.' % (len(bad), 'looks' if len(bad) == 1 else 'look'))
+    if not files:
+        print('Nothing here ends in %s. Go back and check the location.' % EXT)
+        return
+    if not st['identify']:
+        out = st['out'] or DEFAULT_OUT_DIR
+        free = _ui_free_bytes(out)
+        if free is not None and total and free < total:
+            print('Warning: recovered files need about %s but only %s is free near %s.' % (_ui_human_bytes(total), _ui_human_bytes(free), os.path.abspath(out)))
+
+def ui_step_where(st):
+    options = [('Search this whole machine', 'every drive and user folder'),
+               ('One or more folders I choose', ''),
+               ('A single file', '')]
+    default = {'machine': 1, 'folders': 2, 'file': 3}[st['where']]
+    n = ui_choose_one('Where should I look for your encrypted files?', options, default,
+                      'Option 1 needs no setup and is the right choice if you are not sure. Options 2 and 3 are faster when you know where the files are.')
+    st['where'] = ('machine', 'folders', 'file')[n - 1]
+
+def ui_step_paths(st):
+    if st['where'] == 'file':
+        st['paths'] = [ui_ask_path('Path to the encrypted file', 'file', (st['paths'] or [None])[0])]
+        return
+    paths = []
+    print()
+    print('Folders to search (subfolders are included). Press Enter on a blank line when done.')
+    first = True
+    while True:
+        prompt = 'Folder %d' % (len(paths) + 1)
+        p = ui_ask_path(prompt, 'dir', allow_blank=not first)
+        if p is None:
+            break
+        if p not in paths:
+            paths.append(p)
+        first = False
+    st['paths'] = paths
+
+LEVELS = ('quick', 'standard', 'thorough', 'custom')
+
+def ui_step_level(st):
+    options = [('Quick', 'known keys only, seconds to minutes'),
+               ('Standard', 'adds variants and the fitted model, recommended'),
+               ('Thorough', 'adds structural brute force. Can take hours'),
+               ('Custom', 'choose the pieces yourself')]
+    n = ui_choose_one('How hard should I try to find the key?', options, LEVELS.index(st['level']) + 1,
+                      'The key is a word the attackers typed. Quick tries the ones already recovered. Standard also tries likely variations. Thorough also tries every short string, which only finishes for short keys.')
+    st['level'] = LEVELS[n - 1]
+
+CUSTOM_OPTIONS = [('I have a key (or several)', ''),
+                  ('I have a wordlist file', ''),
+                  ('Search a memory dump, pagefile or strings file for the key', ''),
+                  ('Also try the fitted model of how these operators type keys', ''),
+                  ('Also try structural brute force', 'slow'),
+                  ('Widen every search', 'much slower; needs the fitted model'),
+                  ('Use the GPU', 'needs pyopencl'),
+                  ('Save progress so a long run can resume', '')]
+
+def ui_step_custom(st):
+    picked = []
+    if st['keys']:
+        picked.append(1)
+    if st['wordlist']:
+        picked.append(2)
+    if st['scavenge']:
+        picked.append(3)
+    for flag, n in (('model', 4), ('structural', 5), ('deep', 6), ('gpu', 7)):
+        if st[flag]:
+            picked.append(n)
+    if st['checkpoint']:
+        picked.append(8)
+    chosen = ui_choose_many('Custom: pick any that apply.', CUSTOM_OPTIONS, picked,
+                            'Join the numbers you want with +, for example 1+4+8. Enter with nothing typed keeps the current picks.')
+    st['keys'], st['wordlist'], st['scavenge'] = [], None, []
+    if 1 in chosen:
+        print()
+        print('Type each key and press Enter. Leave a line blank when done.')
+        while True:
+            k = ui_ask_text('Key %d' % (len(st['keys']) + 1), allow_blank=bool(st['keys']))
+            if k is None:
+                break
+            if k not in st['keys']:
+                st['keys'].append(k)
+    if 2 in chosen:
+        st['wordlist'] = ui_ask_path('Path to the wordlist (one key per line)', 'file')
+    if 3 in chosen:
+        print()
+        print('Never point this at an encrypted file. Leave a line blank when done.')
+        while True:
+            p = ui_ask_path('Dump %d' % (len(st['scavenge']) + 1), 'file', allow_blank=bool(st['scavenge']))
+            if p is None:
+                break
+            st['scavenge'].append(p)
+    st['model'] = 4 in chosen
+    st['structural'] = 5 in chosen
+    st['deep'] = 6 in chosen
+    st['gpu'] = 7 in chosen
+    if st['deep'] and not st['model']:
+        print('Widening needs the fitted model, so it has been added.')
+        st['model'] = True
+    st['checkpoint'] = (ui_ask_text('Progress file', st['checkpoint'] or UI_PROGRESS_FILE) if 8 in chosen else None)
+
+def ui_step_load(st):
+    cpus = os.cpu_count() or 1
+    options = [('All %d cores' % cpus, 'fastest'), ('Half the cores', 'keeps the machine usable'), ('One core', 'slowest, least disruptive')]
+    cur = st['workers']
+    default = 1 if not cur else (3 if cur == 1 else 2)
+    n = ui_choose_one('How much of this machine can I use?', options, default,
+                      'More cores finds the key sooner. Choose fewer if you need to keep using the computer.')
+    st['workers'] = (None, max(1, cpus // 2), 1)[n - 1]
+
+OUTPUT_OPTIONS = [('Only find the key, write nothing', ''),
+                  ('Put everything in one flat folder', ''),
+                  ('Overwrite files that already exist', ''),
+                  ('Also write files that failed verification', 'marked .UNVERIFIED'),
+                  ('Never write anything that failed verification', ''),
+                  ('Do not correct swapped file extensions', '')]
+
+def ui_step_options(st):
+    picked = [n for n, key in ((1, 'identify'), (2, 'flat'), (3, 'overwrite'), (4, 'keep_unverified'), (5, 'strict'), (6, 'no_fix_ext')) if st[key]]
+    while True:
+        chosen = ui_choose_many('Output options (optional). Pick any that apply, or press Enter to keep the defaults.', OUTPUT_OPTIONS, picked,
+                                'The defaults are safe: files are recovered into a new folder, mirrored paths, and extension mix-ups are repaired.')
+        if 4 in chosen and 5 in chosen:
+            print('Options 4 and 5 contradict each other. Pick one.')
+            picked = chosen
+            continue
+        break
+    for n, key in ((1, 'identify'), (2, 'flat'), (3, 'overwrite'), (4, 'keep_unverified'), (5, 'strict'), (6, 'no_fix_ext')):
+        st[key] = n in chosen
+
+def ui_step_out(st):
+    if st['identify']:
+        return
+    st['out'] = ui_ask_text('Folder to save recovered files into', st['out'] or DEFAULT_OUT_DIR)
+
+UI_STEPS = [('where', ui_step_where, None),
+            ('paths', ui_step_paths, lambda st: st['where'] != 'machine'),
+            ('level', ui_step_level, None),
+            ('custom', ui_step_custom, lambda st: st['level'] == 'custom'),
+            ('load', ui_step_load, None),
+            ('options', ui_step_options, None),
+            ('out', ui_step_out, None)]
+
+def ui_review(st):
+    """Show the settings and ask whether to run. Returns 'run', 'edit' or
+    'cancel'."""
+    argv = ui_build_argv(st)
+    print()
+    print(UI_RULE)
+    print('Ready to go')
+    print(UI_RULE)
+    where = {'machine': 'the whole machine', 'folders': '; '.join(st['paths']), 'file': ''.join(st['paths'])}[st['where']]
+    print('Look in        : %s' % where)
+    print('Effort         : %s' % st['level'].capitalize())
+    if st['level'] == 'custom':
+        parts = []
+        if st['keys']:
+            parts.append('%d supplied key(s)' % len(st['keys']))
+        if st['wordlist']:
+            parts.append('wordlist')
+        if st['scavenge']:
+            parts.append('%d dump(s) to search' % len(st['scavenge']))
+        for flag, label in (('model', 'fitted model'), ('structural', 'structural brute force'), ('deep', 'widened'), ('gpu', 'GPU')):
+            if st[flag]:
+                parts.append(label)
+        print('Custom pieces  : %s' % (', '.join(parts) or 'known keys only'))
+    print('Cores          : %s' % ('all' if not st['workers'] else st['workers']))
+    print('Output         : %s' % ('nothing written (key search only)' if st['identify'] else os.path.abspath(st['out'] or DEFAULT_OUT_DIR)))
+    ui_preview(st)
+    print()
+    print('Same thing from the command line:')
+    print('  ' + ui_command_line(argv))
+    if not os.environ.get(LICENSE_ENV):
+        print()
+        print('You will be asked for your license key next.')
+    n = ui_choose_one('Go ahead?', [('Run now', ''), ('Change something', 'start again with these answers kept'), ('Cancel', 'nothing is changed')], 1,
+                      'Run now starts the search. Nothing is written until a key is found and a file verifies.')
+    return ('run', 'edit', 'cancel')[n - 1]
+
+def run_ui():
+    """Walk the setup screens. Returns an argument list for main(), or None
+    when the user cancels."""
+    st = ui_new_state()
+    print('Dev7 / Micro decryptor (unmicro) %s' % VERSION)
+    print('Rho-9 Systems. Your first line of unusual defense.')
+    print()
+    print('Your encrypted files are never changed, renamed or deleted.')
+    print('Everything recovered is written to a separate folder.')
+    print('At any prompt: ? for help, b to go back, q to quit.')
+    i = 0
+    try:
+        while True:
+            while i < len(UI_STEPS):
+                name, fn, applies = UI_STEPS[i]
+                if applies is not None and not applies(st):
+                    i += 1
+                    continue
+                try:
+                    fn(st)
+                except UiBack:
+                    i -= 1
+                    while i > 0 and UI_STEPS[i][2] is not None and not UI_STEPS[i][2](st):
+                        i -= 1
+                    i = max(i, 0)
+                    continue
+                i += 1
+            try:
+                verdict = ui_review(st)
+            except UiBack:
+                verdict = 'edit'
+            if verdict == 'run':
+                return ui_build_argv(st)
+            if verdict == 'cancel':
+                print('Cancelled. Nothing was changed.')
+                return None
+            i = 0
+    except UiQuit:
+        print()
+        print('Cancelled. Nothing was changed.')
+        return None
 
 def alone_on_console(attached, frozen):
     """True when nothing but this program is attached to its console, which

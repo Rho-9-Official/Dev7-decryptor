@@ -479,5 +479,178 @@ class ProbeSelection(Base):
         self.assertIsNone(unmicro._GCM_PROBE_CACHE[big][2])
 
 
+class InteractiveUi(unittest.TestCase):
+    """The setup menu that opens when the tool runs with no arguments."""
+
+    def setUp(self):
+        self._orig_input = unmicro._ui_input
+        self.dir = tempfile.mkdtemp(prefix='unmicro-ui-')
+        self.prompts = []
+
+    def tearDown(self):
+        unmicro._ui_input = self._orig_input
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def feed(self, answers):
+        it = iter(answers)
+
+        def fake(prompt):
+            self.prompts.append(prompt)
+            try:
+                return next(it)
+            except StopIteration:
+                raise EOFError
+        unmicro._ui_input = fake
+
+    def run_ui(self, answers):
+        self.feed(answers)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            argv = unmicro.run_ui()
+        self.out = buf.getvalue()
+        return argv
+
+    # selection parsing
+    def test_plus_style_selection(self):
+        self.assertEqual(unmicro.parse_selection('1+2+4', 5), [1, 2, 4])
+
+    def test_other_separators_ranges_all_none(self):
+        self.assertEqual(unmicro.parse_selection('1,3', 5), [1, 3])
+        self.assertEqual(unmicro.parse_selection('1 3', 5), [1, 3])
+        self.assertEqual(unmicro.parse_selection('2-4', 5), [2, 3, 4])
+        self.assertEqual(unmicro.parse_selection('a', 3), [1, 2, 3])
+        self.assertEqual(unmicro.parse_selection('n', 3), [])
+        self.assertEqual(unmicro.parse_selection('2+2+1', 3), [2, 1])
+
+    def test_bad_selection_rejected(self):
+        for bad in ('0', '9', 'x', '3-1', '1+x'):
+            with self.assertRaises(ValueError):
+                unmicro.parse_selection(bad, 5)
+
+    # argument building
+    def test_build_argv_levels(self):
+        st = unmicro.ui_new_state()
+        st['level'] = 'quick'
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto'])
+        st['level'] = 'standard'
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto', '--brute'])
+        st['level'] = 'thorough'
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto', '--brute', '--dumb-brute', '--checkpoint', unmicro.UI_PROGRESS_FILE])
+
+    def test_build_argv_places(self):
+        st = unmicro.ui_new_state()
+        st.update(where='file', paths=['/x/a.cryptedmicro'], level='quick')
+        self.assertEqual(unmicro.ui_build_argv(st), ['--in', '/x/a.cryptedmicro'])
+        st.update(where='folders', paths=['/x/one'])
+        self.assertEqual(unmicro.ui_build_argv(st), ['--in', '/x/one', '--recursive'])
+        st.update(where='folders', paths=['/x/one', '/y/two'])
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto', '--scan-root', '/x/one', '--scan-root', '/y/two'])
+
+    def test_build_argv_custom_combination(self):
+        st = unmicro.ui_new_state()
+        st.update(level='custom', keys=['aa', 'bb'], wordlist='/w.txt', scavenge=['/m.dmp'], model=True, structural=True,
+                  deep=True, gpu=True, checkpoint='p.json', workers=2, flat=True, strict=True, out='/o')
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto', '--key', 'aa', '--key', 'bb', '--wordlist', '/w.txt', '--scavenge', '/m.dmp',
+                                                     '--brute', '--dumb-brute', '--deep', '--gpu', '--checkpoint', 'p.json', '--workers', '2',
+                                                     '--flat', '--strict', '--out', '/o'])
+
+    def test_identify_drops_output_folder(self):
+        st = unmicro.ui_new_state()
+        st.update(identify=True, out='/o')
+        self.assertEqual(unmicro.ui_build_argv(st), ['--auto', '--brute', '--identify'])
+
+    def test_built_argv_parses_in_main(self):
+        # Every combination the menu can produce must be accepted by main.
+        st = unmicro.ui_new_state()
+        st.update(level='custom', keys=['aa'], wordlist='/w', scavenge=['/m'], model=True, structural=True, deep=True, gpu=True,
+                  checkpoint='p', workers=2, flat=True, overwrite=True, keep_unverified=True, no_fix_ext=True, out='/o')
+        argv = unmicro.ui_build_argv(st) + ['--self-test']
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(unmicro.main(argv), 0)
+
+    # scripted walk-throughs
+    def test_whole_machine_standard(self):
+        argv = self.run_ui(['1', '2', '1', '', '', '1'])
+        self.assertEqual(argv, ['--auto', '--brute'])
+        self.assertIn('unmicro.py --auto --brute', self.out)
+
+    def test_folder_custom_multi_select(self):
+        argv = self.run_ui(['2', self.dir, '', '4', '1+4+8', 'abc', '', '', '1', '', '', '1'])
+        self.assertEqual(argv, ['--in', self.dir, '--recursive', '--key', 'abc', '--brute', '--checkpoint', unmicro.UI_PROGRESS_FILE])
+
+    def test_several_folders(self):
+        other = tempfile.mkdtemp(prefix='unmicro-ui2-')
+        try:
+            argv = self.run_ui(['2', self.dir, other, '', '1', '1', '', '', '1'])
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+        self.assertEqual(argv, ['--auto', '--scan-root', self.dir, '--scan-root', other])
+
+    def test_back_goes_to_previous_screen(self):
+        argv = self.run_ui(['1', 'b', '1', '1', '1', '', '', '1'])
+        self.assertEqual(argv, ['--auto'])
+
+    def test_back_skips_screens_that_do_not_apply(self):
+        # From the effort screen with "whole machine", back must land on the
+        # location screen, not on the folder screen.
+        self.run_ui(['1', 'b', 'q'])
+        self.assertEqual(sum(1 for p in self.prompts if 'Folder' in p), 0)
+
+    def test_bad_input_asks_again(self):
+        argv = self.run_ui(['1', 'x', '9', '2', '1', '', '', '1'])
+        self.assertEqual(argv, ['--auto', '--brute'])
+        self.assertIn('Please type a number', self.out)
+
+    def test_contradictory_output_options_rejected(self):
+        argv = self.run_ui(['1', '1', '1', '4+5', '4', '', '1'])
+        self.assertIn('contradict', self.out)
+        self.assertEqual(argv, ['--auto', '--keep-unverified'])
+
+    def test_quit_and_end_of_input_cancel(self):
+        self.assertIsNone(self.run_ui(['q']))
+        self.assertIsNone(self.run_ui(['1', '2', 'quit']))
+        self.assertIsNone(self.run_ui(['1']))
+
+    def test_review_cancel_and_edit(self):
+        self.assertIsNone(self.run_ui(['1', '2', '1', '', '', '3']))
+        argv = self.run_ui(['1', '2', '1', '', '', '2', '1', '1', '1', '', '', '1'])
+        self.assertEqual(argv, ['--auto'])
+
+    def test_identify_skips_output_folder_prompt(self):
+        argv = self.run_ui(['1', '2', '1', '1', '1'])
+        self.assertEqual(argv, ['--auto', '--brute', '--identify'])
+        self.assertFalse(any('save recovered files' in p for p in self.prompts))
+
+    def test_ui_text_is_plain_ascii(self):
+        self.run_ui(['2', self.dir, '', '4', 'a', 'k', '', '/dev/null', '', '', '', '', '', 'x'])
+        self.run_ui(['1', '2', '1', '', '', '1'])
+        self.assertTrue(all(ord(c) < 128 for c in self.out))
+        self.assertTrue(all(ord(c) < 128 for c in ''.join(self.prompts)))
+
+    # entry point
+    def test_main_without_arguments_opens_menu_only_on_a_terminal(self):
+        saved = (unmicro.ui_is_interactive, unmicro.run_ui, sys.argv)
+        try:
+            sys.argv = ['unmicro.py']
+            unmicro.ui_is_interactive = lambda: True
+            unmicro.run_ui = lambda: None
+            self.assertEqual(unmicro.main(), 0)
+            called = []
+            unmicro.run_ui = lambda: called.append(1)
+            unmicro.ui_is_interactive = lambda: False
+            with contextlib.redirect_stdout(io.StringIO()):
+                unmicro.main(['--self-test'])
+            self.assertEqual(called, [])
+        finally:
+            unmicro.ui_is_interactive, unmicro.run_ui, sys.argv = saved
+
+    def test_no_ui_env_var_disables_menu(self):
+        os.environ[unmicro.UI_NO_UI_ENV] = '1'
+        try:
+            self.assertFalse(unmicro.ui_is_interactive())
+        finally:
+            del os.environ[unmicro.UI_NO_UI_ENV]
+
+
 if __name__ == '__main__':
     unittest.main()

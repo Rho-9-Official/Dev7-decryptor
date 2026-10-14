@@ -35,6 +35,13 @@ and a probe that can never open hides the key from the whole sweep.
   cannot run AES over megabytes per guess.
 - **Large GCM probes are streamed.** A probe over 16 MB is read from disk for
   each guess instead of being held in memory.
+- **Interactive menu.** Run with no options on a terminal and the tool asks
+  where the files are, how hard to try, how many cores to use, output options
+  and where to save, then shows a review screen with the equivalent command
+  line before it starts. Choices that combine take `+`-joined answers (`1+2+4`);
+  commas, spaces and ranges also work. Plain text only. `--no-ui` or
+  `UNMICRO_NO_UI=1` skips it and keeps the old no-options full-auto run, and
+  scripts and CI are unaffected because the menu only opens on a terminal.
 
 ## 3.8.2
 

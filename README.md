@@ -223,9 +223,30 @@ above.
 Run any build with `--version` to see which release you have, and
 `--self-test` to confirm it unpacked intact (both run without a license).
 
-**Double-clicking the Windows binary** runs it with no options: full-auto,
-which searches every drive, tries every route and writes to
-`unmicro-recovered` in the folder the binary sits in. When the run ends the
+**Run with no options, or double-click the Windows binary,** and a short menu
+asks what to do. It asks where your files are (the whole machine, one or more
+folders, or a single file), how hard to try for the key, how much of the
+machine it may use, a few output options, and where to save the results. A
+review screen then shows every choice and the equivalent command line, and
+nothing starts until you pick Run. At any prompt, `?` explains the choice, `b`
+goes back and `q` quits; nothing is changed if you quit.
+
+Where several choices can be combined, join the numbers with `+`:
+
+```
+Custom: pick any that apply.
+  1  I have a key (or several)
+  2  I have a wordlist file
+  ...
+  8  Save progress so a long run can resume
+Choose, e.g. 1+3 (Enter = none, a = all, n = none): 1+4+8
+```
+
+Commas, spaces and ranges such as `2-4` work too. The menu only opens on a
+terminal with no options given. Scripts, CI and every command above behave as
+before. To skip the menu and get the old behaviour of a full-auto search, pass
+`--no-ui` (or set `UNMICRO_NO_UI=1`); that run searches every drive, tries
+every route and writes to `unmicro-recovered`. When the run ends the Windows
 window stays open until you press Enter, so the result can be read. Pressing
 Ctrl+C during the key search stops it and still writes every file already
 matched to a key.
@@ -592,7 +613,8 @@ report the device.
 
 | flag | effect |
 | --- | --- |
-| (no options) | search every drive, try every route, write to `./unmicro-recovered` |
+| (no options) | open the interactive menu on a terminal. With `--no-ui`: search every drive, try every route, write to `./unmicro-recovered` |
+| `--no-ui` | skip the menu. Also set by `UNMICRO_NO_UI=1` |
 | `--license KEY` | this build's license key. Also read from `UNMICRO_LICENSE`, else prompted |
 | `--self-test` | sealed-blob integrity + AES back end check. Does not need a license |
 | `--list-keys` | print the recovered operator keys this build knows about. Needs a license |
