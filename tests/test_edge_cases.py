@@ -691,6 +691,20 @@ class PlainReport(unittest.TestCase):
         self.assertIn('KEY CHECK FINISHED', v)
         self.assertIn('Nothing was written', text)
 
+    def test_pause_menu_says_search_is_stopped(self):
+        orig = unmicro._ui_input
+        buf = io.StringIO()
+        import builtins
+        old_input = builtins.input
+        builtins.input = lambda prompt='': '1'
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(unmicro.STATUS.pause_menu(), 1)
+        finally:
+            builtins.input = old_input
+        self.assertIn('PAUSED', buf.getvalue())
+        self.assertIn('stopped', buf.getvalue())
+
     def test_plain_reason_wording(self):
         self.assertIn('does not open', unmicro.plain_reason('padding invalid'))
         self.assertIn('damaged', unmicro.plain_reason('length is not a multiple of 16'))

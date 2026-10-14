@@ -281,6 +281,12 @@ class Status(object):
             self._old_handler = None
 
     def _on_sigint(self, signum, frame):
+        if not self.pause_requested:
+            try:
+                sys.stderr.write('\nCtrl+C received. Pausing as soon as the current step finishes (a few seconds)...\n')
+                sys.stderr.flush()
+            except Exception:
+                pass
         self.pause_requested = True
 
     def disarm_pause(self):
@@ -317,7 +323,10 @@ class Status(object):
 
     def pause_menu(self):
         print()
-        print('Paused. Nothing has been lost.')
+        print('=' * 60)
+        print('PAUSED. The search is stopped and will not continue until you choose.')
+        print('Nothing has been lost.')
+        print('=' * 60)
         print('  1  Keep searching')
         print('  2  Stop searching and recover the files already matched to a key')
         print('  3  Quit now without recovering anything')
