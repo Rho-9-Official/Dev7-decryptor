@@ -763,6 +763,17 @@ class StatusOutput(Base):
         self.assertIn('Damaged (not a key issue)        1', out)
         self.assertIn('Still locked (need a key)        0', out)
 
+    def test_file_list_run_keeps_chosen_level(self):
+        # A retry from the menu names only a file list. It must not turn into
+        # the whole-machine, every-method run.
+        make_ecb(self.p('a.jpg.cryptedmicro'), KEY, jpeg(4000))
+        lst = self.p('list.txt')
+        with open(lst, 'w') as fh:
+            fh.write(self.p('a.jpg.cryptedmicro') + '\n')
+        code, out = self.run_main('--file-list', lst, '--key', KEY)
+        self.assertNotIn('Full automatic', out)
+        self.assertIn('Mode:        Quick', out)
+
     def test_quiet_prints_less_than_verbose(self):
         make_ecb(self.p('a.jpg.cryptedmicro'), KEY, jpeg(4000))
         _, q = self.run_main('--in', self.dir, '--key', KEY, '--quiet')

@@ -186,6 +186,7 @@ class Status(object):
         print()
         print(self.RULE)
         self._said_none = set()
+        self._said_again = False
         print('STEP %d OF %d: %s' % (n, self.total_steps, title.upper()))
         print(self.RULE)
         if blurb:
@@ -237,7 +238,7 @@ class Status(object):
         where = ' (method %d of %d)' % (idx, total) if total else ''
         elapsed = fmt_elapsed(time.time() - self.search_t0) if self.search_t0 else '0:00'
         slow = '  slow on purpose, this is normal' if rate < 10 else ''
-        self.live('Still searching%s: %s | %s | %s elapsed%s' % (where, plain_method(name), '%s %s tried' % (fmt_count(tried), 'key' if tried == 1 else 'keys'), elapsed, slow))
+        self.live('Still searching%s: %s tried, %s elapsed | %s%s' % (where, '%s %s' % (fmt_count(tried), 'key' if tried == 1 else 'keys'), elapsed, plain_method(name), slow))
 
     def tier_done(self, name, count, hit, note='', gcm=False):
         if self.mode == 'quiet':
@@ -254,6 +255,9 @@ class Status(object):
             # "nothing found" once per method so the log does not look stuck.
             said = self.__dict__.setdefault('_said_none', set())
             if name in said:
+                if not self.__dict__.get('_said_again'):
+                    self._said_again = True
+                    print('  Still nothing from this method for the remaining files.')
                 return
             said.add(name)
             print('  Nothing found using %s (%s %s tried). Moving on.' % (plain_method(name), fmt_count(count), 'key' if count == 1 else 'keys'))
@@ -3129,7 +3133,7 @@ def run_once(argv):
     if args.seen_cap:
         globals()['SEEN_CAP'] = max(1000, args.seen_cap)
     explicit_brute = args.brute
-    full_auto = not args.src and (not args.auto)
+    full_auto = not args.src and (not args.auto) and (not args.file_list)
     if full_auto:
         args.auto = True
         if not (args.brute or args.deep or args.dumb_brute or args.key or args.wordlist or args.scavenge or args.force):
