@@ -223,29 +223,33 @@ class EndToEnd(Base):
         self.poison()
         code, out = self.run_main('--in', self.dir, '--key', KEY)
         self.assertEqual(code, 0, out)
-        self.assertIn('Recovered and verified : 3', out)
+        self.assertIn('PARTLY RECOVERED', out)
+        self.assertRegex(out, r'Recovered and checked \.*\s+3\b')
 
     def test_aligned_gcm_not_stuck_behind_ecb_brute(self):
         # Plaintext length 4 mod 16 makes the GCM file block-aligned.
         make_gcm(self.p('aligned.jpg.cryptedmicro'), KEY, jpeg(16 * 300 + 4))
         self.assertEqual(os.path.getsize(self.p('aligned.jpg.cryptedmicro')) % 16, 0)
-        code, out = self.run_main('--in', self.dir, '--key', KEY, '--brute', '--max-candidates', '5000')
+        code, out = self.run_main('--in', self.dir, '--key', KEY, '--brute', '--max-candidates', '5000', '--verbose')
         self.assertEqual(code, 0, out)
         self.assertIn('before any brute force', out)
-        self.assertIn('Recovered and verified : 1', out)
+        self.assertIn('ALL USABLE FILES RECOVERED', out)
+        self.assertRegex(out, r'Recovered and checked \.*\s+1\b')
 
     def test_ecb_still_recovers(self):
         make_ecb(self.p('old.jpg.cryptedmicro'), KEY, jpeg(4000))
         code, out = self.run_main('--in', self.dir, '--key', KEY)
         self.assertEqual(code, 0, out)
-        self.assertIn('Recovered and verified : 1', out)
+        self.assertIn('ALL USABLE FILES RECOVERED', out)
+        self.assertRegex(out, r'Recovered and checked \.*\s+1\b')
 
     def test_mixed_ecb_and_gcm_with_brute(self):
         make_ecb(self.p('old.jpg.cryptedmicro'), KEY, jpeg(4000))
         self.good_gcm(2)
         code, out = self.run_main('--in', self.dir, '--key', KEY, '--brute', '--max-candidates', '5000')
         self.assertEqual(code, 0, out)
-        self.assertIn('Recovered and verified : 3', out)
+        self.assertIn('ALL USABLE FILES RECOVERED', out)
+        self.assertRegex(out, r'Recovered and checked \.*\s+3\b')
 
     def test_no_key_message_names_files_tested(self):
         # More files than GCM_ROTATE_FILES, none openable: the message has
@@ -253,7 +257,7 @@ class EndToEnd(Base):
         n = unmicro.GCM_ROTATE_FILES + 2
         for i in range(n):
             junk(self.p('j%02d.jpg.cryptedmicro' % i), 401 + i * 2)
-        code, out = self.run_main('--in', self.dir, '--key', KEY)
+        code, out = self.run_main('--in', self.dir, '--key', KEY, '--verbose')
         self.assertEqual(code, 2, out)
         self.assertIn('checked against %d of the %d' % (unmicro.GCM_ROTATE_FILES, n), out)
 
@@ -650,6 +654,120 @@ class InteractiveUi(unittest.TestCase):
             self.assertFalse(unmicro.ui_is_interactive())
         finally:
             del os.environ[unmicro.UI_NO_UI_ENV]
+
+
+
+class PlainReport(unittest.TestCase):
+    """The plain-language wording and the final result report."""
+
+    def verdict(self, **res):
+        v, lines = unmicro.build_result_report(res)
+        return v, '\n'.join(lines)
+
+    def test_all_recovered(self):
+        v, text = self.verdict(recovered=4, out='/x', usable=4)
+        self.assertEqual(v, 'ALL USABLE FILES RECOVERED')
+
+    def test_nothing_recovered_no_key(self):
+        v, text = self.verdict(recovered=0, locked=['a', 'b'], usable=2)
+        self.assertIn('NO KEY FOUND', v)
+        self.assertIn('STILL LOCKED: 2', text)
+
+    def test_partly_recovered(self):
+        v, text = self.verdict(recovered=2, locked=['a'], usable=3, out='/x')
+        self.assertEqual(v, 'PARTLY RECOVERED')
+
+    def test_damaged_is_not_called_a_key_problem(self):
+        v, text = self.verdict(recovered=1, damaged=['d1', 'd2'], usable=1, out='/x')
+        self.assertIn('DAMAGED', text)
+        self.assertNotIn('STILL LOCKED', text)
+
+    def test_problems_listed(self):
+        v, text = self.verdict(recovered=1, failed=[('f', 'cannot write: disk full')], usable=2, out='/x')
+        self.assertTrue(text)
+
+    def test_key_check_only(self):
+        v, text = self.verdict(identify=True, keys=['k'], covered=2, usable=3, locked=['a'])
+        self.assertIn('KEY CHECK FINISHED', v)
+        self.assertIn('Nothing was written', text)
+
+    def test_plain_reason_wording(self):
+        self.assertIn('does not open', unmicro.plain_reason('padding invalid'))
+        self.assertIn('damaged', unmicro.plain_reason('length is not a multiple of 16'))
+        self.assertEqual(unmicro.plain_reason('weird'), 'weird')
+
+    def test_methods_fold_brute_lengths(self):
+        names = ['structural brute len=%d' % n for n in range(4, 9)]
+        out = unmicro.summarize_methods(names)
+        self.assertEqual(len(out), 1)
+        self.assertIn('4 to 8', out[0])
+
+    def test_next_step_hints_escalate(self):
+        a = unmicro.next_step_hint(False, False, True)
+        b = unmicro.next_step_hint(True, False, True)
+        c = unmicro.next_step_hint(True, True, True)
+        self.assertEqual(len({a, b, c}), 3)
+
+    def test_retry_argv_escalates_and_writes_list(self):
+        argv = ['--in', '/a', '--key', 'k']
+        r = unmicro.ui_retry_argv(argv, ['/f1', '/f2'], True)
+        self.assertIn('--brute', r)
+        self.assertNotIn('/a', r)
+        path = r[r.index('--file-list') + 1]
+        with open(path) as fh:
+            self.assertEqual(fh.read().split(), ['/f1', '/f2'])
+        r2 = unmicro.ui_retry_argv(r, ['/f1'], True)
+        self.assertIn('--dumb-brute', r2)
+        unmicro._ui_cleanup_temp()
+        self.assertFalse(os.path.exists(path))
+
+    def test_retry_argv_none_at_top(self):
+        self.assertIsNone(unmicro.ui_retry_argv(['--dumb-brute', '--deep'], ['/f'], True))
+
+
+@unittest.skipUnless(LICENSE, 'set %s to run the end-to-end tests' % unmicro.LICENSE_ENV)
+class StatusOutput(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.out = tempfile.mkdtemp(prefix='unmicro-out-')
+        self.addCleanup(shutil.rmtree, self.out, True)
+
+    def run_main(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = unmicro.main(['--license', LICENSE, '--workers', '1', '--out', self.out] + list(argv))
+        return code, buf.getvalue()
+
+    def test_output_is_ascii_and_staged(self):
+        make_ecb(self.p('old.jpg.cryptedmicro'), KEY, jpeg(4000))
+        code, out = self.run_main('--in', self.dir, '--key', KEY)
+        self.assertEqual(code, 0, out)
+        out.encode('ascii')
+        for n in range(1, 6):
+            self.assertIn('STEP %d OF 5' % n, out)
+
+    def test_file_list_limits_scope(self):
+        make_ecb(self.p('a.jpg.cryptedmicro'), KEY, jpeg(4000))
+        make_ecb(self.p('b.jpg.cryptedmicro'), KEY, jpeg(4100))
+        lst = self.p('list.txt')
+        with open(lst, 'w') as fh:
+            fh.write(self.p('a.jpg.cryptedmicro') + '\n')
+        code, out = self.run_main('--file-list', lst, '--key', KEY, '--flat')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(os.listdir(self.out)), ['a.jpg'])
+
+    def test_damaged_shown_separately_from_locked(self):
+        make_ecb(self.p('a.jpg.cryptedmicro'), KEY, jpeg(4000))
+        open(self.p('stub.jpg.cryptedmicro'), 'wb').close()
+        code, out = self.run_main('--in', self.dir, '--key', KEY)
+        self.assertIn('Damaged (not a key issue)        1', out)
+        self.assertIn('Still locked (need a key)        0', out)
+
+    def test_quiet_prints_less_than_verbose(self):
+        make_ecb(self.p('a.jpg.cryptedmicro'), KEY, jpeg(4000))
+        _, q = self.run_main('--in', self.dir, '--key', KEY, '--quiet')
+        _, v = self.run_main('--in', self.dir, '--key', KEY, '--verbose', '--overwrite')
+        self.assertLess(len(q), len(v))
 
 
 if __name__ == '__main__':

@@ -10,6 +10,26 @@ original, so a run that was cut short leaves stubs and half-written files.
 On a machine with many of them, the smallest files were chosen as probes,
 and a probe that can never open hides the key from the whole sweep.
 
+### Changed: plain-language progress and results
+- Output is now five numbered steps (finding files, checking files, looking
+  for the key, recovering files, results), so it is always clear which part
+  of the job is running.
+- A live status line shows the method in use ("method 2 of 3"), how many keys
+  have been tried and the time elapsed, and says so when slow is normal.
+- The final report puts every file in exactly one row: recovered, damaged
+  (not a key issue), still locked (needs a key), or had a problem. It opens
+  with a one-line verdict such as `PARTLY RECOVERED` and a plain "Next:" hint.
+  This is how to tell a new key from corrupted files at a glance.
+- `--verbose` brings back the technical detail; `--quiet` prints the minimum.
+  Output is plain ASCII.
+
+### Added: pause, retry and file lists
+- Ctrl+C opens a pause menu (keep searching, stop and recover what is matched,
+  or quit) instead of killing the run.
+- After a run started from the menu, a next-steps menu offers to retry only
+  the files still locked, at the same or a harder level.
+- `--file-list FILE` works on the paths listed in FILE instead of searching.
+
 ### Added
 - **Damaged-copy screen.** Before any probe is chosen, files that cannot be a
   whole ciphertext are set aside: zero-byte files, lengths that are neither a

@@ -321,6 +321,21 @@ On by default. Pass `--no-fix-ext` to turn it off and keep the original names.
 
 ---
 
+## Reading the output
+
+The run is split into five numbered steps, and the last one is a report where
+each file is counted once:
+
+| Row | Meaning |
+|---|---|
+| Recovered and checked | unlocked, structure verified, saved |
+| Damaged (not a key issue) | the encrypted copy itself is cut short or empty; no key can fix it |
+| Still locked (need a key) | intact, but no key found yet; a new or different key is the usual reason |
+| Had a problem | something else, such as a disk or permission error; the reason is printed |
+
+Press Ctrl+C at any time to pause. Use `--verbose` for technical detail and
+`--quiet` for the minimum. `--file-list FILE` works on just the paths in FILE.
+
 ## What it will and will not do to your files
 
 * Your encrypted files are **never modified, renamed or deleted**. They are
