@@ -533,6 +533,13 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Damaged copies, plain output, interactive menu (3.9).** Files left damaged
+  by an interrupted attack are screened out before keys are tested and listed
+  in `corrupted-files.txt`. Key probes are chosen from larger files spread
+  across sizes and folders. Running with no arguments opens a plain-text menu.
+  Output is five numbered steps with a final report that separates recovered,
+  damaged, still-locked and problem files. Ctrl+C pauses, and a retry menu
+  covers only the files still locked. See the changelog for details.
 - **Edge-case fixes (3.8.2).** A machine-wide or double-click run could report
   0 hits on files the recovered keys open, if the two smallest GCM files were
   partial or under another key; the recovered keys now move on through up to
