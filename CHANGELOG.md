@@ -2,7 +2,7 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
-## Unreleased
+## 3.9
 
 Damaged copies from interrupted encryption runs no longer break the file
 picker. The malware writes a new `.cryptedmicro` copy and then deletes the
