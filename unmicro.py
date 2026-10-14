@@ -185,6 +185,7 @@ class Status(object):
         self.live_done()
         print()
         print(self.RULE)
+        self._said_none = set()
         print('STEP %d OF %d: %s' % (n, self.total_steps, title.upper()))
         print(self.RULE)
         if blurb:
@@ -236,7 +237,7 @@ class Status(object):
         where = ' (method %d of %d)' % (idx, total) if total else ''
         elapsed = fmt_elapsed(time.time() - self.search_t0) if self.search_t0 else '0:00'
         slow = '  slow on purpose, this is normal' if rate < 10 else ''
-        self.live('Still searching%s: %s | %s keys tried | %s elapsed%s' % (where, plain_method(name), fmt_count(tried), elapsed, slow))
+        self.live('Still searching%s: %s | %s | %s elapsed%s' % (where, plain_method(name), '%s %s tried' % (fmt_count(tried), 'key' if tried == 1 else 'keys'), elapsed, slow))
 
     def tier_done(self, name, count, hit, note='', gcm=False):
         if self.mode == 'quiet':
@@ -249,6 +250,12 @@ class Status(object):
         if hit:
             print('  FOUND a key using %s.' % plain_method(name))
         else:
+            # Later passes over leftover files repeat the same methods. Say
+            # "nothing found" once per method so the log does not look stuck.
+            said = self.__dict__.setdefault('_said_none', set())
+            if name in said:
+                return
+            said.add(name)
             print('  Nothing found using %s (%s %s tried). Moving on.' % (plain_method(name), fmt_count(count), 'key' if count == 1 else 'keys'))
 
     # Ctrl+C during the key search asks for a pause rather than killing the
@@ -2716,11 +2723,15 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
         if mapping and later_plan is not None:
             pass_plan = later_plan
         if mapping and (not quiet):
-            print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
-            skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
-            if skipped:
-                print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
-                print('   re-run with --brute to include them)')
+            if STATUS.verbose:
+                print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
+                skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
+                if skipped:
+                    print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
+                    print('   re-run with --brute to include them)')
+            else:
+                print('  %d file(s) are not opened by the key found so far. Looking for another key' % len(remaining))
+                print('  for them (some may have been locked with a different key):')
         found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed)
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
