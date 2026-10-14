@@ -51,6 +51,20 @@ GCM_PROBES = 2
 GCM_ROTATE_FILES = 16
 GCM_ROTATE_TIERS = ('supplied keys', 'recovered operator keys')
 GCM_PROBE_CACHE_CAP = 4
+# Probe choice. Probes are the files every key guess is tested against. They
+# are taken from files of at least PROBE_MIN_BYTES where there are enough,
+# spread across sizes and across folders: never two from one folder unless
+# PROBE_DOMINANT_DIR of all files already live in one. A run that was cut
+# short damages files in the folder it was working through, so probes from
+# several folders are unlikely to all be hit. PROBE_MAX_BYTES keeps a
+# multi-gigabyte file from being chosen, since confirming a key reads the
+# whole probe. GCM probes over GCM_STREAM_ABOVE are streamed from disk per
+# guess rather than held in memory.
+PROBE_MIN_BYTES = 10 * 1024 * 1024
+PROBE_MAX_BYTES = 256 * 1024 * 1024
+PROBE_DOMINANT_DIR = 0.60
+PURE_PROBE_MAX_BYTES = 65536
+GCM_STREAM_ABOVE = 16 * 1024 * 1024
 # Tiers cheap enough to run in both formats before any open-ended search, so
 # a block-aligned GCM file is not left waiting behind the ECB brute.
 QUICK_TIERS = ('supplied keys', 'wordlist', 'recovered operator keys', 'scavenged strings')
@@ -70,6 +84,431 @@ def setup_console():
             stream.reconfigure(encoding='utf-8', errors='replace')
         except Exception:
             pass
+
+# ---------------------------------------------------------------------------
+# Plain-language status. Everything the tool says while it works, and the
+# report at the end, goes through here so a person who has never seen a
+# command line can tell three things apart at any moment: what the tool is
+# doing right now, whether it is still working, and why a file was not
+# recovered (a key that is not found yet, a damaged file, or something else).
+# Three levels: plain (the default), verbose (adds the technical detail and
+# the original tier-by-tier lines) and quiet.
+# ---------------------------------------------------------------------------
+PLAIN_METHODS = {
+    'supplied keys': 'the key you gave me',
+    'wordlist': 'your wordlist',
+    'recovered operator keys': 'keys already recovered from the attackers',
+    'scavenged strings': 'words found in your memory dump',
+    'recovered key variants': 'small variations of the known keys',
+    'fitted model': 'keys guessed from how these attackers type',
+}
+
+def plain_method(name):
+    if name.startswith('structural brute len='):
+        return 'every possible key of %s characters' % name.rsplit('=', 1)[1]
+    return PLAIN_METHODS.get(name, name)
+
+def fmt_count(n):
+    return '{:,}'.format(int(n))
+
+def fmt_elapsed(secs):
+    secs = int(max(0, secs))
+    h, rest = divmod(secs, 3600)
+    m, s = divmod(rest, 60)
+    return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
+
+def plain_reason(err):
+    """Turn a technical failure reason into a sentence a non-specialist can
+    act on. Unknown reasons are passed through unchanged."""
+    e = (err or '').strip()
+    low = e.lower()
+    if 'padding invalid' in low or 'tag mismatch' in low:
+        return 'the key that was tried does not open this file'
+    if 'not a multiple of 16' in low or 'inconsistent' in low or 'too short' in low:
+        return 'the file is damaged (cut short or incomplete)'
+    if 'is empty' in low:
+        return 'the file is empty'
+    if low.startswith('cannot write'):
+        return 'it could not be saved (%s)' % e.split(':', 1)[-1].strip()
+    if low.startswith('cannot read'):
+        return 'it could not be read (%s)' % e.split(':', 1)[-1].strip()
+    if 'did not validate' in low or 'no recognised file structure' in low:
+        return 'it unlocked, but the result does not look like a valid file, so it was not saved'
+    return e or 'unknown problem'
+
+class SearchAbort(Exception):
+    """The person chose to quit from the pause menu."""
+
+class Status(object):
+    RULE = '=' * 60
+
+    def __init__(self):
+        self.reset('plain', 5)
+
+    def reset(self, mode, total_steps):
+        self.mode = mode
+        self.total_steps = total_steps
+        self.search_t0 = None
+        self.method_pos = (0, 0)
+        self.live_len = 0
+        self.last_log = 0.0
+        self.gate_declined = False
+        self.pause_requested = False
+        self.pause_enabled = False
+
+    def configure(self, quiet=False, verbose=False, identify=False):
+        self.reset('quiet' if quiet else 'verbose' if verbose else 'plain', 4 if identify else 5)
+
+    @property
+    def quiet(self):
+        return self.mode == 'quiet'
+
+    @property
+    def verbose(self):
+        return self.mode == 'verbose'
+
+    def say(self, text=''):
+        if self.mode != 'quiet':
+            print(text)
+
+    def tech(self, text=''):
+        if self.mode == 'verbose':
+            print(text)
+
+    def plain(self, text=''):
+        if self.mode == 'plain':
+            print(text)
+
+    def stage(self, n, title, blurb=None):
+        if self.mode == 'quiet':
+            return
+        self.live_done()
+        print()
+        print(self.RULE)
+        self._said_none = set()
+        self._said_again = False
+        print('STEP %d OF %d: %s' % (n, self.total_steps, title.upper()))
+        print(self.RULE)
+        if blurb:
+            print(blurb)
+
+    # A single line that is rewritten in place while the search runs. On a
+    # terminal it updates constantly; in a log or pipe it prints a fresh line
+    # at most every 30 seconds, so there is still proof of life.
+    def live(self, text):
+        if self.mode == 'quiet':
+            return
+        try:
+            tty = sys.stderr.isatty()
+        except Exception:
+            tty = False
+        if tty:
+            line = text[:78]
+            sys.stderr.write('\r' + line.ljust(max(self.live_len, len(line))) + '\r')
+            sys.stderr.flush()
+            self.live_len = len(line)
+        elif time.time() - self.last_log >= 30:
+            self.last_log = time.time()
+            sys.stderr.write(text + '\n')
+            sys.stderr.flush()
+
+    def live_done(self):
+        if self.live_len:
+            sys.stderr.write('\r' + ' ' * self.live_len + '\r')
+            sys.stderr.flush()
+            self.live_len = 0
+
+    def start_search(self):
+        self.search_t0 = time.time()
+
+    def method(self, idx, total):
+        self.method_pos = (idx, total)
+
+    def progress(self, name, tried, rate, gcm=False):
+        if self.mode == 'quiet':
+            return
+        if self.mode == 'verbose':
+            if gcm:
+                sys.stderr.write('  GCM %-22s %11d tried  %9.1f/s\r' % (name[:22], tried, rate))
+            else:
+                sys.stderr.write('  %-26s %11d tried  %9.0f/s\r' % (name[:26], tried, rate))
+            sys.stderr.flush()
+            return
+        idx, total = self.method_pos
+        where = ' (method %d of %d)' % (idx, total) if total else ''
+        elapsed = fmt_elapsed(time.time() - self.search_t0) if self.search_t0 else '0:00'
+        slow = '  slow on purpose, this is normal' if rate < 10 else ''
+        self.live('Still searching%s: %s tried, %s elapsed | %s%s' % (where, '%s %s' % (fmt_count(tried), 'key' if tried == 1 else 'keys'), elapsed, plain_method(name), slow))
+
+    def tier_done(self, name, count, hit, note='', gcm=False):
+        if self.mode == 'quiet':
+            return
+        self.live_done()
+        if self.mode == 'verbose':
+            label = ('GCM tier %-26s' % name) if gcm else ('tier %-30s' % name)
+            print('  %s %13d candidates  %s%s' % (label, count, 'HIT' if hit else 'no hit', note))
+            return
+        if hit:
+            print('  FOUND a key using %s.' % plain_method(name))
+        else:
+            # Later passes over leftover files repeat the same methods. Say
+            # "nothing found" once per method so the log does not look stuck.
+            said = self.__dict__.setdefault('_said_none', set())
+            if name in said:
+                if not self.__dict__.get('_said_again'):
+                    self._said_again = True
+                    print('  Still nothing from this method for the remaining files.')
+                return
+            said.add(name)
+            print('  Nothing found using %s (%s %s tried). Moving on.' % (plain_method(name), fmt_count(count), 'key' if count == 1 else 'keys'))
+
+    # Ctrl+C during the key search asks for a pause rather than killing the
+    # run. The handler only sets a flag; the sweeps look at it between
+    # batches and call check_pause().
+    def arm_pause(self, interactive):
+        self.pause_requested = False
+        self._old_handler = None
+        if not interactive:
+            return
+        try:
+            import signal
+            import threading
+            if threading.current_thread() is not threading.main_thread():
+                return
+            self._old_handler = signal.signal(signal.SIGINT, self._on_sigint)
+            self.pause_enabled = True
+        except Exception:
+            self._old_handler = None
+
+    def _on_sigint(self, signum, frame):
+        if not self.pause_requested:
+            try:
+                sys.stderr.write('\nCtrl+C received. Pausing as soon as the current step finishes (a few seconds)...\n')
+                sys.stderr.flush()
+            except Exception:
+                pass
+        self.pause_requested = True
+
+    def disarm_pause(self):
+        if self.pause_enabled:
+            try:
+                import signal
+                signal.signal(signal.SIGINT, self._old_handler if self._old_handler is not None else signal.SIG_DFL)
+            except Exception:
+                pass
+        self.pause_enabled = False
+        self.pause_requested = False
+
+    def check_pause(self):
+        if not self.pause_requested:
+            return
+        self.pause_requested = False
+        self.live_done()
+        import signal
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except Exception:
+            pass
+        try:
+            choice = self.pause_menu()
+        finally:
+            try:
+                signal.signal(signal.SIGINT, self._on_sigint)
+            except Exception:
+                pass
+        if choice == 2:
+            raise KeyboardInterrupt()
+        if choice == 3:
+            raise SearchAbort()
+
+    def pause_menu(self):
+        print()
+        print('=' * 60)
+        print('PAUSED. The search is stopped and will not continue until you choose.')
+        print('Nothing has been lost.')
+        print('=' * 60)
+        print('  1  Keep searching')
+        print('  2  Stop searching and recover the files already matched to a key')
+        print('  3  Quit now without recovering anything')
+        try:
+            raw = input('Choose [1]: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            return 2
+        return int(raw) if raw in ('1', '2', '3') else 1
+
+STATUS = Status()
+
+def _ignore_sigint():
+    """Pool workers leave Ctrl+C to the parent, which decides what to do.
+    The initialisers that call this also run in the parent, which must keep
+    its own handler."""
+    try:
+        import multiprocessing
+        import signal
+        if multiprocessing.current_process().name == 'MainProcess':
+            return
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+def describe_mode(args, full_auto):
+    """One line naming the search mode in words."""
+    if args.identify:
+        base = 'Key check only. Nothing will be written'
+    elif full_auto:
+        base = 'Full automatic: every method, the whole machine'
+    elif args.dumb_brute:
+        base = 'Thorough: known keys, likely variations, then every short key'
+    elif args.brute:
+        base = 'Standard: known keys, then likely variations'
+    else:
+        base = 'Quick: known keys only'
+    extras = []
+    if args.key:
+        extras.append('your key')
+    if args.wordlist:
+        extras.append('your wordlist')
+    if args.scavenge:
+        extras.append('a memory dump')
+    if args.gpu:
+        extras.append('GPU')
+    return base + (' (plus %s)' % ', '.join(extras) if extras else '')
+
+def human_bytes(n):
+    n = float(n)
+    for unit in ('bytes', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return '%d %s' % (n, unit) if unit == 'bytes' else '%.1f %s' % (n, unit)
+        n /= 1024.0
+
+def summarize_methods(names):
+    """Plain labels for the key methods in a plan, with the many structural
+    brute force lengths folded into one line."""
+    out = []
+    lengths = []
+    for n in names:
+        if n.startswith('structural brute len='):
+            lengths.append(int(n.rsplit('=', 1)[1]))
+            continue
+        out.append(plain_method(n))
+    if lengths:
+        out.append('every possible key of %d to %d characters (slow, may not finish)' % (min(lengths), max(lengths)) if len(lengths) > 1 else 'every possible key of %d characters (slow)' % lengths[0])
+    return out
+
+def next_step_hint(brute, dumb_brute, any_ecb):
+    """What to try next, in words, for files that no key has opened."""
+    if not brute:
+        return 'search harder. Run again at the Standard level (--brute), which also tries likely variations of the known keys.'
+    if not any_ecb:
+        return 'search a memory dump, pagefile or hibernation file for the key (--scavenge FILE), or supply a key you know (--key).'
+    if not dumb_brute:
+        return 'search harder. Run again at the Thorough level (--dumb-brute) and add --checkpoint FILE so a long run can resume.'
+    return 'widen the search (--deep, --charset full), or search a memory dump for the key (--scavenge FILE).'
+
+def build_result_report(res):
+    """The final report as (verdict, lines). res describes the run: counts
+    and lists for each kind of outcome. Every file that was found ends up in
+    exactly one place: recovered, damaged, still locked, or had a problem."""
+    recovered = res.get('recovered', 0) + res.get('unverified', 0)
+    damaged = res.get('damaged', [])
+    locked = res.get('locked', [])
+    failed = res.get('failed', [])
+    keys = res.get('keys', [])
+    stopped = res.get('stopped_early')
+    out = res.get('out')
+    lines = []
+    if res.get('identify'):
+        covered = res.get('covered', 0)
+        if keys:
+            verdict = 'KEY CHECK FINISHED: %d KEY(S) FOUND' % len(keys)
+        else:
+            verdict = 'KEY CHECK FINISHED: NO KEY FOUND YET'
+        lines.append('Keys found: %d. Files these keys open: %s of %s.' % (len(keys), fmt_count(covered), fmt_count(res.get('usable', 0))))
+        lines.append('Nothing was written, because this was a key check only.')
+        if locked:
+            lines.append('')
+            lines.append('NOT OPENED BY ANY KEY YET: %s file(s)' % fmt_count(len(locked)))
+            for path in locked[:10]:
+                lines.append('    %s' % path)
+            if len(locked) > 10:
+                lines.append('    ... and %s more' % fmt_count(len(locked) - 10))
+            if res.get('next_step'):
+                lines.append('  Next: %s' % res['next_step'])
+        if damaged:
+            lines.append('')
+            lines.append('DAMAGED FILES: %s (not a key problem, they cannot be unlocked)' % fmt_count(len(damaged)))
+    elif recovered == 0 and not locked and not failed and damaged:
+        verdict = 'NOTHING TO RECOVER: EVERY FILE IS DAMAGED'
+    elif recovered == 0:
+        verdict = 'STOPPED EARLY: NOTHING RECOVERED YET' if stopped else ('NO KEY FOUND YET: NOTHING RECOVERED' if not failed else 'NOTHING RECOVERED: THERE WERE PROBLEMS')
+    elif not locked and not failed and not stopped:
+        verdict = 'ALL USABLE FILES RECOVERED'
+    else:
+        verdict = 'PARTLY RECOVERED'
+    if not res.get('identify'):
+        lines.append('')
+        lines.append('  Recovered and checked ... %8s%s' % (fmt_count(recovered), ('   saved in %s' % out) if out and recovered else ''))
+        lines.append('  Damaged (not a key issue) %8s%s' % (fmt_count(len(damaged)), '   list in %s' % os.path.join(out, DAMAGE_REPORT) if out and damaged else ''))
+        lines.append('  Still locked (need a key) %8s' % fmt_count(len(locked)))
+        lines.append('  Had a problem ........... %8s' % fmt_count(len(failed)))
+        if len(keys) > 1:
+            lines.append('')
+            lines.append('%d different keys were needed. That is normal: when an attack is' % len(keys))
+            lines.append('interrupted and started again, the new run uses a new key.')
+        if damaged:
+            lines.append('')
+            lines.append('DAMAGED FILES: %s' % fmt_count(len(damaged)))
+            lines.append('  These were left half-written when the attack was interrupted. Their')
+            lines.append('  contents are missing or incomplete in these copies, so no key can')
+            lines.append('  bring them back. This is NOT a key problem. Keep them anyway, and')
+            lines.append('  if the originals exist elsewhere (backups, cloud, shadow copies),')
+            lines.append('  restore from there.')
+        if locked:
+            lines.append('')
+            lines.append('STILL LOCKED: %s' % fmt_count(len(locked)))
+            if stopped:
+                lines.append('  The search was stopped before it finished, so these may still')
+                lines.append('  open. Run it again to carry on.')
+            else:
+                lines.append('  No key found for these yet. Most often the attack was run again')
+                lines.append('  with a different key. These files are intact; they just need the')
+                lines.append('  right key.')
+            hint = res.get('next_step')
+            if hint:
+                lines.append('  Next: %s' % hint)
+        if failed:
+            lines.append('')
+            lines.append('FILES THAT HAD A PROBLEM: %s' % fmt_count(len(failed)))
+            lines.append('  A key was found for these but something went wrong while saving them.')
+            for path, why in failed[:10]:
+                lines.append('    %s: %s' % (os.path.basename(path), why))
+            if len(failed) > 10:
+                lines.append('    ... and %s more' % fmt_count(len(failed) - 10))
+        if recovered == 0 and locked and not stopped:
+            lines.append('')
+            lines.append('In the meantime:')
+            lines.append('  - Do not wipe the machine or delete the encrypted files.')
+            lines.append('  - Do not pay, and do not run the attackers\' unlock command.')
+            lines.append('  - If the machine is still infected, take it off the network but')
+            lines.append('    leave it switched on. The key may still be in memory.')
+            lines.append('  - Mention Chattering Magpies when you post about this.')
+    return (verdict, lines)
+
+def print_result_report(res):
+    verdict, lines = build_result_report(res)
+    STATUS.live_done()
+    print()
+    print(STATUS.RULE)
+    print('STEP %d OF %d: RESULTS' % (STATUS.total_steps, STATUS.total_steps))
+    print(STATUS.RULE)
+    print('RESULT: %s' % verdict)
+    for ln in lines:
+        print(ln)
+    print()
+    print('Your encrypted files were not changed.')
+    print()
+    print('Rho-9 Systems. Your first line of unusual defense.')
+    return verdict
 
 def long_path(path):
     if not WINDOWS or not path:
@@ -930,6 +1369,133 @@ def ecb_shaped(size):
 def gcm_shaped(size):
     return size is not None and size >= GCM_MIN_LEN
 
+# Damaged-copy screen. The malware writes a new <name>.cryptedmicro and then
+# deletes the original, so a run that was cut short leaves stubs behind: empty
+# files, a few stray bytes, files extended with zeros, files cut mid-write.
+# These are screened out before any probe is chosen, because a probe that can
+# never open under the right key hides that key from the whole sweep.
+DAMAGE_ZERO_RUN = 32
+DAMAGE_REPORT = 'corrupted-files.txt'
+DAMAGE_LABELS = {
+    'unreadable': 'could not be read',
+    'empty': 'empty (0 bytes)',
+    'stub': 'only a few stray bytes, too small to be a real file',
+    'zero-head': 'filled with blank data, never actually written',
+    'zero-tail': 'cut off: the end is blank data',
+    'truncated': 'cut short: the start unlocks but the rest is missing',
+}
+
+def classify_damage(path, size):
+    """Key-free structural screen for a damaged .cryptedmicro copy.
+
+    Returns None when the file could be a whole ciphertext, else
+    (code, detail). Every rule here is exact or near impossible to trip by
+    chance: AES output is indistinguishable from random, so a 16 byte block
+    or a 32 byte run of zeros has odds of 2^-128 or better of turning up in
+    a genuine file. A file that is damaged but still looks whole (cut at an
+    odd length above 43 bytes, say) cannot be told from a good one without
+    a key; diagnose_damaged() picks those up once a key is known."""
+    if size is None:
+        return ('unreadable', 'size could not be read')
+    if size == 0:
+        return ('empty', 'file is 0 bytes')
+    if not ecb_shaped(size) and not gcm_shaped(size):
+        return ('stub', 'length %d is not a multiple of 16 and is under the %d byte AES-GCM minimum' % (size, GCM_MIN_LEN))
+    try:
+        with open(long_path(path), 'rb') as fh:
+            head = _read_exact(fh, 16)
+            tail = b''
+            if size > DAMAGE_ZERO_RUN:
+                fh.seek(size - DAMAGE_ZERO_RUN)
+                tail = _read_exact(fh, DAMAGE_ZERO_RUN)
+    except OSError as e:
+        return ('unreadable', 'cannot read: %s' % e)
+    if len(head) == 16 and head == b'\x00' * 16:
+        return ('zero-head', 'first 16 bytes are all zero')
+    if len(tail) == DAMAGE_ZERO_RUN and tail == b'\x00' * DAMAGE_ZERO_RUN:
+        return ('zero-tail', 'last %d bytes are all zero' % DAMAGE_ZERO_RUN)
+    return None
+
+def split_damaged(files, sizes):
+    """(whole-looking files, [(path, size, code, detail)]) with order kept."""
+    good, bad = [], []
+    for f in files:
+        verdict = classify_damage(f, sizes.get(f))
+        if verdict is None:
+            good.append(f)
+        else:
+            bad.append((f, sizes.get(f), verdict[0], verdict[1]))
+    return (good, bad)
+
+def diagnose_damaged(paths, keys, limit_keys=16):
+    """Second stage, run once keys are known. For files no key opened, a
+    file whose first block decrypts to a recognised file signature under a
+    known ECB key was a real encryption that was cut short or damaged,
+    rather than a file under some key we have not found. Returns
+    [(path, size, 'truncated', detail)]."""
+    if _dec_blocks is None:
+        _init_backend()
+    found = []
+    for p in paths:
+        try:
+            with open(long_path(p), 'rb') as fh:
+                first = _read_exact(fh, 16)
+        except OSError:
+            continue
+        if len(first) < 16:
+            continue
+        for k in list(keys)[:limit_keys]:
+            block = _dec_blocks(key_bytes(k), first)
+            # Three signature bytes or more: a stray two byte match (BM, MZ)
+            # would turn up by chance across thousands of unrelated files.
+            label = next((lab for off, magic, lab, _ in SIGNATURES if len(magic) >= 3 and block[off:off + len(magic)] == magic), None)
+            if label:
+                found.append((p, file_size(p), 'truncated', 'first block opens as %s under key %r, but the whole file does not verify' % (label, k)))
+                break
+    return found
+
+def write_damage_report(dst, damaged, quiet=False):
+    """Write the list of excluded files next to the recovered output. Only
+    ever creates the report; encrypted originals are not touched."""
+    if not damaged or not dst:
+        return None
+    path = os.path.join(dst, DAMAGE_REPORT)
+    lines = ['Dev7 / Micro damaged .cryptedmicro files excluded from the key search.',
+             'These look like copies left by an interrupted encryption run. Keep them:',
+             'a copy cut short can still hold a recoverable start of the file.',
+             '',
+             '%-10s %12s  %s' % ('reason', 'bytes', 'path')]
+    for p, size, code, detail in damaged:
+        lines.append('%-10s %12s  %s' % (code, '?' if size is None else size, p))
+        lines.append('%s%s' % (' ' * 24, detail))
+    try:
+        os.makedirs(long_path(dst), exist_ok=True)
+        with open(long_path(path), 'w', encoding='utf-8', errors='replace') as fh:
+            fh.write('\n'.join(lines) + '\n')
+    except OSError as e:
+        if not quiet:
+            print('Could not write %s: %s' % (DAMAGE_REPORT, e))
+        return None
+    return path
+
+def print_damage_summary(damaged, report=None, limit=10):
+    if not damaged:
+        return
+    counts = collections.OrderedDict()
+    for _, _, code, _ in damaged:
+        counts[code] = counts.get(code, 0) + 1
+    print('%s file(s) are damaged and have been set aside:' % fmt_count(len(damaged)))
+    for code, n in counts.items():
+        print('    %8s  %s' % (fmt_count(n), DAMAGE_LABELS.get(code, code)))
+    for p, size, code, _ in damaged[:limit]:
+        print('      %s  (%s)' % (p, '? bytes' if size is None else human_bytes(size)))
+    if len(damaged) > limit:
+        print('      ... and %s more' % fmt_count(len(damaged) - limit))
+    if report:
+        print('  Full list saved to: %s' % report)
+    print('  These were left behind when the attack was interrupted. This is not a key')
+    print('  problem and they cannot be unlocked. They have not been deleted or changed.')
+
 _KDF_CACHE = collections.OrderedDict()
 
 def _gcm_password(key_string):
@@ -1134,16 +1700,14 @@ def walk_for_encrypted(roots, prune=True, progress=True, limit=None):
                         found.append(plain_path(os.path.join(dirpath, name)))
                         if limit and len(found) >= limit:
                             if progress:
-                                sys.stderr.write(' ' * 72 + '\r')
+                                STATUS.live_done()
                             return sorted(found)
                 if progress and seen_dirs % 400 == 0:
-                    sys.stderr.write('  scanning... %d folders, %d encrypted files, %.0fs\r' % (seen_dirs, len(found), time.time() - t0))
-                    sys.stderr.flush()
+                    STATUS.live('Still looking: %s folders checked, %s encrypted files found so far, %s elapsed' % (fmt_count(seen_dirs), fmt_count(len(found)), fmt_elapsed(time.time() - t0)))
             if walked or attempt == root:
                 break
     if progress:
-        sys.stderr.write(' ' * 72 + '\r')
-        sys.stderr.flush()
+        STATUS.live_done()
     return sorted(found)
 
 def collect(root, recursive):
@@ -1554,6 +2118,70 @@ def build_plan(brute=False, deep=False, dumb=False, extra=None, wordlist=None, s
             plan.append(('structural brute len=%d' % length, lambda L=length, A=alpha: get_model().gen_dumb_len(L, alphabet=A)))
     return plan
 
+def probe_size_bounds():
+    """(floor, ceiling) in bytes for the files used as key probes. A large
+    file is far less likely to be a stub or a stray fragment than the
+    smallest one in the set. The pure-python back end cannot afford to run
+    AES over megabytes per guess, so it keeps to tiny probes."""
+    if BACKEND == 'pure-python':
+        return (0, PURE_PROBE_MAX_BYTES)
+    return (PROBE_MIN_BYTES, PROBE_MAX_BYTES)
+
+def _dir_of(path):
+    return os.path.normcase(os.path.dirname(path))
+
+def dominant_directory_share(paths):
+    """Fraction of the files that sit in the single busiest folder."""
+    paths = list(paths)
+    if not paths:
+        return 0.0
+    counts = collections.Counter(_dir_of(p) for p in paths)
+    return max(counts.values()) / float(len(paths))
+
+def _quantile_targets():
+    # 0.5, 0.25, 0.75, 0.125, 0.625, ... so successive picks land at
+    # different points of the size range rather than clustering at one end.
+    yield 0.5
+    denom = 4
+    while True:
+        for num in range(1, denom, 2):
+            yield num / float(denom)
+        denom *= 2
+
+def select_probes(entries, want, same_dir_ok, lo, hi, min_probes=1, avoid_dirs=None):
+    """Choose up to want probe files from entries, [(size, path)].
+
+    Files whose size is inside [lo, hi] come first, then smaller ones, then
+    larger ones. Inside a size band the picks are spread across the size
+    range. Two probes are never taken from the same folder, unless
+    same_dir_ok (60% or more of all files share one folder, so spreading is
+    not possible) or fewer than min_probes could otherwise be found, so a
+    run with only a couple of folders is not left without a probe. Folders
+    in avoid_dirs count as already used."""
+    ents = sorted(entries, key=lambda e: (e[0], e[1]))
+    tiers = [[e for e in ents if lo <= e[0] <= hi], [e for e in ents if e[0] < lo], [e for e in ents if e[0] > hi]]
+    chosen = []
+    taken = set()
+    used = set(avoid_dirs or ())
+
+    def run(dir_rule):
+        for tier in tiers:
+            targets = _quantile_targets()
+            while len(chosen) < want:
+                avail = [i for i, e in enumerate(tier) if e[1] not in taken and not (dir_rule and _dir_of(e[1]) in used)]
+                if not avail:
+                    break
+                aim = next(targets) * (len(tier) - 1)
+                i = min(avail, key=lambda j: (abs(j - aim), j))
+                path = tier[i][1]
+                chosen.append(path)
+                taken.add(path)
+                used.add(_dir_of(path))
+    run(True)
+    if len(chosen) < want and (same_dir_ok or len(chosen) < min_probes):
+        run(False)
+    return chosen
+
 def probe_set(files, max_probes=4):
     groups = {}
     for p in files:
@@ -1565,10 +2193,17 @@ def probe_set(files, max_probes=4):
         if len(b) == 16:
             groups.setdefault(b, []).append(p)
     ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    lo, hi = probe_size_bounds()
+    same_dir_ok = dominant_directory_share([p for ps in groups.values() for p in ps]) >= PROBE_DOMINANT_DIR
     out = []
+    used = set()
     for blk, paths in ordered[:max_probes]:
-        smallest = min(paths, key=lambda p: os.path.getsize(p))
-        out.append((blk, smallest))
+        entries = [(file_size(p) or 0, p) for p in paths]
+        pick = select_probes(entries, 1, same_dir_ok, lo, hi, avoid_dirs=used)
+        if not pick:
+            continue
+        used.add(_dir_of(pick[0]))
+        out.append((blk, pick[0]))
     return out
 
 def confirm_key(key_string, path):
@@ -1581,6 +2216,7 @@ def _worker_init(probes, license_key=None):
     in each child with KNOWN_KEYS == None, so the license key is passed
     through initargs and the sealed blobs are re-unlocked per worker."""
     global _WORKER_PROBES
+    _ignore_sigint()
     _WORKER_PROBES = probes
     if BACKEND is None:
         _init_backend(False)
@@ -1660,7 +2296,8 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
     elif saved_name is not None:
         start_consumed, tried = (0, 0)
     if not quiet and (start_tier or start_consumed or tried):
-        print("  resuming from checkpoint: '%s', %d candidate(s) already tried" % (names[start_tier] if start_tier < len(names) else saved_name, tried))
+        STATUS.say("  Resuming from saved progress: %s keys were already tried." % fmt_count(tried))
+        STATUS.tech("  resuming from checkpoint: '%s', %d candidate(s) already tried" % (names[start_tier] if start_tier < len(names) else saved_name, tried))
     _worker_init(probes, license_key)
     t0 = time.time()
     if gpu is not None and chunk_size < 1 << 18:
@@ -1678,7 +2315,9 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
                 continue
             if on_tier_start is not None and (not on_tier_start(name, tier_idx)):
                 _ckpt_save(checkpoint, sig, name, 0, tried)
+                STATUS.gate_declined = True
                 return ([], tried)
+            STATUS.method(tier_idx + 1, len(plan))
             if gpu is not None and gpu.alphabet is not None and name.startswith('structural brute len='):
                 length = int(name.rsplit('=', 1)[1])
                 total = gpu._N ** length
@@ -1701,19 +2340,16 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
                     consumed += count
                     _ckpt_save(checkpoint, sig, name, consumed, tried)
                     if not quiet:
-                        rate = tried / max(time.time() - t0, 0.001)
-                        sys.stderr.write('  %-26s %13d tried  %9.0f/s\r' % (name[:26], tried, rate))
-                        sys.stderr.flush()
+                        STATUS.progress(name, tried, tried / max(time.time() - t0, 0.001))
+                    STATUS.check_pause()
                     if confirmed:
                         break
                     if limit and tried >= limit:
                         if not quiet:
-                            sys.stderr.write(' ' * 72 + '\r')
+                            STATUS.live_done()
                         return ([], tried)
                 if not quiet:
-                    sys.stderr.write(' ' * 72 + '\r')
-                    sys.stderr.flush()
-                    print('  tier %-30s %13d candidates  %s' % (name, tried - tier_start, 'HIT' if confirmed else 'no hit'))
+                    STATUS.tier_done(name, tried - tier_start, bool(confirmed))
                 if confirmed:
                     _ckpt_clear(checkpoint)
                     return (confirmed, tried)
@@ -1724,8 +2360,7 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
             consumed = 0
             if tier_idx == start_tier and start_consumed:
                 if not quiet:
-                    sys.stderr.write('  fast-forwarding %d candidate(s)...\r' % start_consumed)
-                    sys.stderr.flush()
+                    STATUS.live('Picking up where the last run stopped...')
                 collections.deque(itertools.islice(gen, start_consumed), maxlen=0)
                 consumed = start_consumed
             tier_start = tried
@@ -1755,22 +2390,19 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
                         rejected += 1
                 _ckpt_save(checkpoint, sig, name, consumed, tried)
                 if not quiet:
-                    rate = tried / max(time.time() - t0, 0.001)
-                    sys.stderr.write('  %-26s %11d tried  %9.0f/s\r' % (name[:26], tried, rate))
-                    sys.stderr.flush()
+                    STATUS.progress(name, tried, tried / max(time.time() - t0, 0.001))
+                STATUS.check_pause()
                 if confirmed:
                     break
                 if limit and tried >= limit:
                     if not quiet:
-                        sys.stderr.write(' ' * 72 + '\r')
+                        STATUS.live_done()
                     return ([], tried)
             if not quiet:
-                sys.stderr.write(' ' * 72 + '\r')
-                sys.stderr.flush()
-                note = 'HIT' if confirmed else 'no hit'
+                note = ''
                 if rejected:
-                    note += '  (%d coincidental header match(es) discarded)' % rejected
-                print('  tier %-30s %13d candidates  %s' % (name, tried - tier_start, note))
+                    note = '  (%d coincidental header match(es) discarded)' % rejected
+                STATUS.tier_done(name, tried - tier_start, bool(confirmed), note)
             if confirmed:
                 _ckpt_clear(checkpoint)
                 return (confirmed, tried)
@@ -1834,7 +2466,7 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
         else:
             budget = None
         if mapping and (not quiet):
-            print('  %d file(s) not covered yet, sweeping those on their own:' % len(remaining))
+            STATUS.say('  %s file(s) are still locked. Looking for another key for them.' % fmt_count(len(remaining)))
         found, tried = sweep(remaining, plan, workers=workers, limit=budget, quiet=quiet, checkpoint=checkpoint, on_tier_start=on_tier_start, gpu=gpu, license_key=license_key)
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
@@ -1863,34 +2495,49 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
 # file has its own salt, and every guess costs a 600,000-round PBKDF2 before
 # a single AES block can be tried. In exchange there are no false positives,
 # because the 128-bit tag either matches or it does not. So the search tries
-# a guess against a couple of the smallest files, accepts it only on a tag
-# match, and then maps the found key across the rest. The smallest files are
-# also the likeliest to be partial or damaged, so the bounded tiers move on
-# to the next files when a pair opens to nothing (GCM_ROTATE_FILES).
+# a guess against a couple of probe files (large, spread across sizes and
+# folders, see select_probes), accepts it only on a tag match, and then maps
+# the found key across the rest. A probe can still be partial or damaged, so
+# the bounded tiers move on to the next files when a pair opens to nothing
+# (GCM_ROTATE_FILES).
 _GCM_PROBE_CACHE = collections.OrderedDict()
 
 def gcm_probe_order(files):
-    """GCM-shaped files, smallest first: the order in which they are used
-    as probes."""
-    sized = sorted(((file_size(p), p) for p in files), key=lambda t: (t[0] is None, t[0] or 0))
-    return [p for size, p in sized if gcm_shaped(size)]
+    """GCM-shaped files in the order they are used as probes: files of at
+    least PROBE_MIN_BYTES first where there are any, spread across sizes and
+    across folders (see select_probes). At most GCM_ROTATE_FILES are
+    returned, which is as many as any tier uses."""
+    cands = [(s, p) for s, p in ((file_size(p), p) for p in files) if gcm_shaped(s)]
+    if not cands:
+        return []
+    lo, hi = probe_size_bounds()
+    same_dir_ok = dominant_directory_share([p for _, p in cands]) >= PROBE_DOMINANT_DIR
+    return select_probes(cands, GCM_ROTATE_FILES, same_dir_ok, lo, hi, min_probes=GCM_PROBES)
 
 def _gcm_probe(path):
     """(salt, iv, body, tag) of a probe file, cached per process so a pool
-    worker reads each probe once rather than once per guess."""
+    worker reads each probe once rather than once per guess. For a file over
+    GCM_STREAM_ABOVE, body is None and only the header is cached: the caller
+    streams the body from disk for each guess instead of holding it."""
     hit = _GCM_PROBE_CACHE.get(path)
     if hit is None:
-        with open(long_path(path), 'rb') as fh:
-            data = fh.read()
-        if len(data) < GCM_MIN_LEN:
-            raise ValueError('too short to be an AES-GCM file')
-        hit = (data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:])
+        size = file_size(path)
+        if size is not None and size > GCM_STREAM_ABOVE:
+            _size, salt, iv, tag = gcm_header(path)
+            hit = (salt, iv, None, tag)
+        else:
+            with open(long_path(path), 'rb') as fh:
+                data = fh.read()
+            if len(data) < GCM_MIN_LEN:
+                raise ValueError('too short to be an AES-GCM file')
+            hit = (data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:])
         _GCM_PROBE_CACHE[path] = hit
         if len(_GCM_PROBE_CACHE) > GCM_PROBE_CACHE_CAP:
             _GCM_PROBE_CACHE.popitem(last=False)
     return hit
 
 def _gcm_worker_init():
+    _ignore_sigint()
     if BACKEND is None:
         _init_backend(False)
 
@@ -1904,9 +2551,16 @@ def _gcm_worker_chunk(job):
             except (OSError, ValueError):
                 continue
             dk = gcm_kdf(cand, salt)
-            ctx = _gcm_new(dk, iv, tag)
-            ctx.update(body)
-            if ctx.verify():
+            if body is None:
+                psize = file_size(path)
+                if psize is None:
+                    continue
+                opened = gcm_stream(path, psize, iv, tag, dk, keep=False)[1] is None
+            else:
+                ctx = _gcm_new(dk, iv, tag)
+                ctx.update(body)
+                opened = ctx.verify()
+            if opened:
                 hits.append((cand, path, salt, dk))
                 break
     return hits
@@ -1968,6 +2622,7 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
                 cands = None
                 rounds = 1
             probes = []
+            STATUS.method(tiers.index((name, factory)) + 1, len(tiers))
             for r in range(rounds):
                 probes = order[r * GCM_PROBES:(r + 1) * GCM_PROBES]
                 if not probes:
@@ -1978,9 +2633,8 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
                     gen = list(gen)
                     rate = tried / max(time.time() - t0, 0.001)
                     if tried and rate > 0:
-                        print('  GCM tier %s: %d candidates, roughly %s at this' % (name, len(gen), _fmt_duration(len(gen) / rate)))
-                        print("    machine's rate. Ctrl+C stops the search and still writes every")
-                        print('    file already matched to a key.')
+                        STATUS.say('  Trying %s: %s keys, roughly %s at this machine\'s speed.' % (plain_method(name), fmt_count(len(gen)), _fmt_duration(len(gen) / rate)))
+                        STATUS.say('  Press Ctrl+C at any time to pause.')
                     gen = iter(gen)
                 while True:
                     chunk = []
@@ -2008,21 +2662,18 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
                         if cand not in found:
                             found.append(cand)
                     if not quiet:
-                        rate = tried / max(time.time() - t0, 0.001)
-                        sys.stderr.write('  GCM %-22s %11d tried  %9.1f/s\r' % (name[:22], tried, rate))
-                        sys.stderr.flush()
+                        STATUS.progress(name, tried, tried / max(time.time() - t0, 0.001), gcm=True)
+                    STATUS.check_pause()
                     if found or (limit and tried >= limit):
                         break
                 if found or (limit and tried >= limit):
                     break
             if not quiet:
-                sys.stderr.write(' ' * 72 + '\r')
-                sys.stderr.flush()
                 spread = ''
                 if cands is not None and rounds > 1:
                     upto = min(len(order), (r + 1) * GCM_PROBES)
                     spread = '  (tested on %d file(s))' % upto
-                print('  GCM tier %-26s %13d candidates  %s%s' % (name, tried - tier_start, 'HIT' if found else 'no hit', spread))
+                STATUS.tier_done(name, tried - tier_start, bool(found), spread, gcm=True)
             if found:
                 return (found, tried)
             if limit and tried >= limit:
@@ -2041,7 +2692,7 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
     mapping = {}
     if not jobs:
         return mapping
-    pool = _make_pool(min(workers, len(jobs)))
+    pool = _make_pool(min(workers, len(jobs)), _ignore_sigint)
     done = 0
     t0 = time.time()
     try:
@@ -2052,15 +2703,13 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
                 _kdf_remember(k, salt, dk)
                 mapping.setdefault(k, []).append(path)
             if not quiet and (done % 8 == 0 or done == len(jobs)):
-                sys.stderr.write('  checking GCM files: %d/%d  %.0fs\r' % (done, len(jobs), time.time() - t0))
-                sys.stderr.flush()
+                STATUS.live('Checking files against the key found: %s of %s done, %s elapsed' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
     finally:
         if pool:
             pool.terminate()
             pool.join()
         if not quiet:
-            sys.stderr.write(' ' * 72 + '\r')
-            sys.stderr.flush()
+            STATUS.live_done()
     order = {p: i for i, p in enumerate(files)}
     for k in mapping:
         mapping[k].sort(key=lambda p: order.get(p, 0))
@@ -2087,11 +2736,15 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
         if mapping and later_plan is not None:
             pass_plan = later_plan
         if mapping and (not quiet):
-            print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
-            skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
-            if skipped:
-                print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
-                print('   re-run with --brute to include them)')
+            if STATUS.verbose:
+                print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
+                skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
+                if skipped:
+                    print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
+                    print('   re-run with --brute to include them)')
+            else:
+                print('  %d file(s) are not opened by the key found so far. Looking for another key' % len(remaining))
+                print('  for them (some may have been locked with a different key):')
         found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed)
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
@@ -2371,7 +3024,30 @@ def plan_extension_fix(name, head):
         return None
     return {'old': cur, 'new': ext, 'category': cat}
 
+# What the last run found, kept so the menu can offer sensible next steps.
+RESULT = {}
+
 def main(argv=None):
+    ui_used = False
+    if argv is None:
+        argv = sys.argv[1:]
+        # No arguments on a terminal: ask what to do instead of guessing.
+        if not argv and ui_is_interactive():
+            argv = run_ui()
+            if argv is None:
+                return 0
+            ui_used = True
+    while True:
+        code = run_once(argv)
+        _ui_cleanup_temp()
+        if not ui_used or not ui_is_interactive():
+            return code
+        argv = ui_next_steps(argv)
+        if argv is None:
+            _ui_cleanup_temp()
+            return code
+
+def run_once(argv):
     ap = argparse.ArgumentParser(prog='unmicro.py', description='Decrypt files encrypted by the Dev7 / Micro ransomware (.cryptedmicro). Your encrypted files are never modified.', formatter_class=argparse.RawDescriptionHelpFormatter)
     g_src = ap.add_argument_group('finding the files')
     g_src.add_argument('--in', dest='src', help='encrypted file, or directory containing .cryptedmicro files')
@@ -2380,6 +3056,8 @@ def main(argv=None):
     g_src.add_argument('--no-prune', action='store_true', help='do not skip system folders while scanning, much slower')
     g_src.add_argument('--recursive', action='store_true', help='walk subdirectories of --in')
     g_src.add_argument('--max-files', type=int, help='stop scanning after this many encrypted files')
+    g_src.add_argument('--file-list', dest='file_list', metavar='FILE', help='read the encrypted files to work on from FILE, one path per line, instead of searching. The menu uses this to retry only the files that are still locked')
+    g_src.add_argument('--no-ui', dest='no_ui', action='store_true', help='skip the interactive menu that opens when the tool is run with no arguments on a terminal. With nothing else given, this runs the old full-auto search. Setting the %s environment variable does the same' % UI_NO_UI_ENV)
     g_lic = ap.add_argument_group('license (per-build)')
     g_lic.add_argument('--license', dest='license', metavar='KEY', help="license key for this build. If omitted, the UNMICRO_LICENSE environment variable is used, else the tool prompts. Contact " + LICENSE_CONTACT + " for a key if you do not have one; mention 'Chattering Magpies'.")
     g_lic.add_argument('--self-test', dest='self_test', action='store_true', help='run a quick self-test (sealed-blob integrity, AES back end). Does not need a license. Used by CI')
@@ -2411,9 +3089,12 @@ def main(argv=None):
     g_out.add_argument('--force', action='store_true', help='apply a single supplied key without header checking')
     g_out.add_argument('--pure-python', action='store_true', help='ignore installed crypto libraries and use the built in AES')
     g_out.add_argument('--quiet', action='store_true', help='less output')
+    g_out.add_argument('--verbose', action='store_true', help='add the technical detail (key methods tried, file formats, probe choices) to the plain-language output')
     g_out.add_argument('-y', '--yes', action='store_true', help='answer yes to prompts, such as continuing --dumb-brute into a long length. For unattended runs')
     ap.add_argument('--version', action='version', version='unmicro.py ' + VERSION)
     args = ap.parse_args(argv)
+    STATUS.configure(quiet=args.quiet, verbose=args.verbose, identify=args.identify)
+    RESULT.clear()
 
     # Routes that do not need a license, in order.
     if args.self_test:
@@ -2461,7 +3142,7 @@ def main(argv=None):
     if args.seen_cap:
         globals()['SEEN_CAP'] = max(1000, args.seen_cap)
     explicit_brute = args.brute
-    full_auto = not args.src and (not args.auto)
+    full_auto = not args.src and (not args.auto) and (not args.file_list)
     if full_auto:
         args.auto = True
         if not (args.brute or args.deep or args.dumb_brute or args.key or args.wordlist or args.scavenge or args.force):
@@ -2470,62 +3151,108 @@ def main(argv=None):
     default_out = not args.identify and (not args.dst)
     if default_out:
         args.dst = DEFAULT_OUT_DIR
-    if (args.brute or args.dumb_brute) and BACKEND == 'pure-python' and (not args.quiet):
-        print('Note: no crypto library installed, so guessing will be very slow.')
-        print('      pip install pycryptodome makes --brute thousands of times faster.')
-        print()
-    if not args.quiet:
-        print('unmicro.py %s   AES back end: %s' % (VERSION, BACKEND))
+    if (args.brute or args.dumb_brute) and BACKEND == 'pure-python':
+        STATUS.say('Note: this computer has no fast crypto library installed, so searching will be')
+        STATUS.say('very slow. Installing one (pip install pycryptodome) makes it thousands of times faster.')
+        STATUS.say()
+    if not STATUS.quiet:
+        print('Dev7 / Micro decryptor (unmicro) %s' % VERSION)
+        STATUS.tech('AES back end: %s' % BACKEND)
         if args.fix_ext and (not args.identify):
             if HAVE_FILETYPE:
-                print('Extension repair on. Type detection: filetype %s.' % FILETYPE_VERSION)
+                STATUS.tech('Extension repair on. Type detection: filetype %s.' % FILETYPE_VERSION)
             else:
-                print('Extension repair on, but the filetype library is not installed,')
-                print('so detection falls back to the smaller built in table. For full')
-                print('coverage: pip install filetype')
-        if full_auto:
-            print('No options given, so running full-auto: searching every drive,')
-            print('trying the recovered keys, the fitted model and the structural')
-            print('brute. Point --in at a folder to narrow it, or --identify to')
-            print('only locate keys.')
-        if default_out:
-            print('Recovered files will be written to ./%s (created for you).' % DEFAULT_OUT_DIR)
+                STATUS.tech('Extension repair on, but the filetype library is not installed,')
+                STATUS.tech('so detection falls back to the smaller built in table. For full')
+                STATUS.tech('coverage: pip install filetype')
         print('Your encrypted files will not be modified, renamed or deleted.')
         print()
-    if args.auto:
+        print('Mode:        %s' % describe_mode(args, full_auto))
+        if args.file_list:
+            looking = 'the files still locked from the last attempt'
+        elif args.auto:
+            looking = '; '.join(args.scan_root) if args.scan_root else 'the whole machine'
+        else:
+            looking = args.src
+        print('Looking in:  %s' % looking)
+        if not args.identify:
+            print('Saving to:   %s' % os.path.abspath(args.dst))
+        if ui_is_interactive():
+            print('Pause:       press Ctrl+C at any time')
+    STATUS.stage(1, 'Finding your files')
+    if args.file_list:
+        try:
+            with open(long_path(args.file_list), 'r', encoding='utf-8', errors='replace') as fh:
+                files = sorted(set(ln.strip() for ln in fh if ln.strip() and os.path.isfile(ln.strip())))
+        except OSError as e:
+            print('Could not read the file list: %s' % e)
+            return 1
+    elif args.auto:
         roots = args.scan_root or candidate_roots()
-        if not args.quiet:
-            print('Searching for encrypted files under:')
-            for r in roots:
-                print('    %s' % r)
+        STATUS.say('Looking through %s. This can take a few minutes.' % ('the whole machine' if not args.scan_root else 'the folders you chose'))
+        for r in roots:
+            STATUS.tech('    %s' % r)
         files = walk_for_encrypted(roots, prune=not args.no_prune, progress=not args.quiet, limit=args.max_files)
     else:
         files = collect(args.src, args.recursive or os.path.isdir(args.src))
     if not files:
-        print('No %s files found.' % EXT)
-        if not args.auto:
-            print('Try --auto to search the whole machine.')
+        STATUS.live_done()
+        print('No %s files were found.' % EXT)
+        if not args.auto and not args.file_list:
+            print('Check that the location is right, or run the whole-machine search.')
         return 1
+    n_found = len(files)
     if not args.quiet:
         dirs = sorted(set((os.path.dirname(f) for f in files)))
-        print('Encrypted files found: %d across %d folder(s)' % (len(files), len(dirs)))
+        STATUS.live_done()
+        print('Found %s encrypted file(s) in %s folder(s).' % (fmt_count(len(files)), fmt_count(len(dirs))))
         for d in dirs[:10]:
             print('    %s' % d)
         if len(dirs) > 10:
-            print('    ... and %d more folders' % (len(dirs) - 10))
-        print()
+            print('    ... and %s more folders' % fmt_count(len(dirs) - 10))
     wordlist = []
     if args.wordlist:
         with open(long_path(args.wordlist), 'r', encoding='utf-8', errors='replace') as fh:
             wordlist = [ln.rstrip('\r\n') for ln in fh if ln.strip()]
     sizes = {f: file_size(f) for f in files}
+    # Interrupted encryption runs leave stubs and cut-short copies. They are
+    # set aside before any probe is chosen so they cannot hide a key.
+    STATUS.stage(2, 'Checking the files', 'Looking for files that were left damaged when the attack was interrupted.')
+    files, damaged = split_damaged(files, sizes)
+    damage_report = None
+    if damaged:
+        damage_report = None if args.identify else write_damage_report(args.dst, damaged, quiet=args.quiet)
+        if not args.quiet or not files:
+            print_damage_summary(damaged, damage_report)
+    else:
+        STATUS.say('No damaged files found.')
+    if files:
+        STATUS.say('%s file(s) look intact and will be tried.' % fmt_count(len(files)))
+
+    def report(code, **kw):
+        res = dict(total=n_found, damaged=damaged, usable=len(files), out=args.dst, identify=args.identify,
+                   recovered=0, unverified=0, locked=[], failed=[], keys=[], stopped_early=False, covered=0, next_step=None,
+                   level='dumb' if args.dumb_brute else 'brute' if args.brute else 'quick')
+        res.update(kw)
+        RESULT.clear()
+        RESULT.update(res)
+        print_result_report(res)
+        return code
+    if not files:
+        return report(2)
     file_scheme = {}
     forced = False
-    if args.force and len(args.key) == 1 and (not args.brute) and (not args.dumb_brute) and (not wordlist) and (not args.scavenge):
+    stopped_early = False
+    unmatched = []
+    will_force = args.force and len(args.key) == 1 and (not args.brute) and (not args.dumb_brute) and (not wordlist) and (not args.scavenge)
+    if will_force:
+        STATUS.stage(3, 'Using your key', 'You asked for your key to be applied to every file without checking.')
+    else:
+        STATUS.stage(3, 'Looking for the key', 'The key is the password the attackers used. Your files stay locked until it is\nfound. Quick methods take seconds; the harder ones can take hours.')
+    if will_force:
         mapping = {args.key[0]: files}
         forced = True
-        if not args.quiet:
-            print('Forced key %r applied to all %d files without header checking.' % (args.key[0], len(files)))
+        STATUS.say('Applying your key to all %s files without checking them first.' % fmt_count(len(files)))
     else:
         model = get_model()
         dumb_alpha = model.dumb_alphabet(args.charset)
@@ -2564,21 +3291,24 @@ def main(argv=None):
             secs = size / gate_rate
             when = '%.0f seconds' % secs if secs < 90 else '%.1f minutes' % (secs / 60.0) if secs < 5400 else '%.1f hours' % (secs / 3600.0) if secs < 172800 else '%.1f days' % (secs / 86400.0)
             print()
-            print('Structural brute has cleared every key shorter than %d characters with' % length)
-            print('no match. Length %d is %s candidates over a %d-character alphabet,' % (length, '{:,}'.format(size), dumb_alpha_n))
-            print("roughly %s at this machine's rate, and each further length is" % when)
-            print('dramatically larger.')
+            print('Every key shorter than %d characters has been tried with no match.' % length)
+            print("The next step, keys of exactly %d characters, is %s possibilities. At this" % (length, '{:,}'.format(size)))
+            print("machine's speed that is roughly %s, and each step after it is far longer." % when)
             if not interactive:
-                print('Not a terminal, so stopping here. Re-run with --yes to let it')
-                print('continue, --max-candidates N to bound it, or --checkpoint FILE')
-                print('to make it resumable.')
+                print('This is not a terminal, so I am stopping here. Run again with --yes to keep')
+                print('going, --max-candidates N to put a limit on it, or --checkpoint FILE so it')
+                print('can be resumed.')
                 return False
             try:
-                ans = input('Continue into length %d? [y/N] ' % length).strip().lower()
+                ans = input('Keep going into %d-character keys? [y/N] ' % length).strip().lower()
             except EOFError:
                 return False
             return ans in ('y', 'yes')
         if not args.quiet:
+            STATUS.say('Methods I will try, in order:')
+            for i, label in enumerate(summarize_methods([n for n, _ in plan]), 1):
+                STATUS.say('  %d. %s' % (i, label))
+            STATUS.say('Using %s.' % ('the GPU (%s)' % gpu.name if gpu is not None else '%d core(s)' % workers))
             routes = []
             if args.scavenge:
                 routes.append('scavenged strings')
@@ -2591,7 +3321,8 @@ def main(argv=None):
             elif workers > 1:
                 routes.append('%d workers' % workers)
             tail = ' (%s)' % ', '.join(routes) if routes else ''
-            print('Trying keys%s:' % tail)
+            STATUS.tech('Trying keys%s:' % tail)
+            STATUS.say()
         mapping = {}
         tried = 0
 
@@ -2624,29 +3355,34 @@ def main(argv=None):
         # format. Block-aligned files can be either, and are settled below.
         gcm_only = [f for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))]
         ecb_cand = [f for f in files if ecb_shaped(sizes[f])]
+        STATUS.start_search()
+        STATUS.arm_pause(interactive)
         try:
             if gcm_only:
                 if not args.quiet:
-                    print('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
-                    print('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
-                    print('stretch on these, so they get the supplied, recovered and variant keys;')
-                    print('the fitted model and structural brute are left to the older files.')
+                    STATUS.say('%s file(s) come from a newer, slower version of the attack. Each key' % fmt_count(len(gcm_only)))
+                    STATUS.say('test takes about a second on these, so only the quick methods are used on them.')
+                    STATUS.tech('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
+                    STATUS.tech('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
+                    STATUS.tech('stretch on these, so they get the supplied, recovered and variant keys;')
+                    STATUS.tech('the fitted model and structural brute are left to the older files.')
                     if gpu is not None:
-                        print('The GPU is not used for the GCM files.')
-                    print()
+                        STATUS.tech('The GPU is not used for the GCM files.')
+                    STATUS.say()
                 gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
                 tried += gtried
                 merge(gmap, 'gcm')
                 aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
                 if gmap and aligned:
                     if not args.quiet:
-                        print('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
+                        STATUS.tech('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
                     part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet)
                     merge(part, 'gcm')
                     ecb_cand = [f for f in ecb_cand if f not in file_scheme]
                 if ecb_cand and (not args.quiet):
-                    print()
-                    print('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
+                    STATUS.say()
+                    STATUS.say('%s file(s) come from the older version of the attack.' % fmt_count(len(ecb_cand)))
+                    STATUS.tech('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
             ecb_keys = []
             quick_plan = [(n, f) for n, f in plan if n in QUICK_TIERS]
             late_gcm_plan = plan
@@ -2663,7 +3399,7 @@ def main(argv=None):
                 aligned_closed = [f for f in ecb_cand if gcm_shaped(sizes[f]) and f not in done]
                 if aligned_closed and (budget_left() is None or budget_left() > 0):
                     if not args.quiet:
-                        print('  checking %d block-aligned file(s) as AES-GCM before any brute force:' % len(aligned_closed))
+                        STATUS.tech('  checking %d block-aligned file(s) as AES-GCM before any brute force:' % len(aligned_closed))
                     gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
                     tried += gtried
                     merge(gmap, 'gcm')
@@ -2686,104 +3422,97 @@ def main(argv=None):
             closed_gcm = [f for f in files if gcm_shaped(sizes[f]) and f not in done]
             if ecb_keys and closed_gcm:
                 if not args.quiet:
-                    print('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
+                    STATUS.tech('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
                 merge(map_gcm_keys_to_files(closed_gcm, ecb_keys, workers=workers, quiet=args.quiet), 'gcm')
             leftover = [f for f in leftover if f not in file_scheme]
             if leftover and (budget_left() is None or budget_left() > 0):
                 if not args.quiet:
-                    print()
-                    print('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
+                    STATUS.tech()
+                    STATUS.tech('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
                 gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
                 tried += gtried
                 merge(gmap, 'gcm')
+        except SearchAbort:
+            STATUS.live_done()
+            print()
+            print('Quit. Nothing was recovered and nothing was changed.')
+            return 130
         except KeyboardInterrupt:
             interrupted = True
-            sys.stderr.write(' ' * 72 + '\r')
+            STATUS.live_done()
             print()
             if not mapping:
-                print('Interrupted before any key was found. Nothing was written.')
+                print('Stopped before any key was found. No files were recovered.')
                 return 130
-            print('Interrupted. Stopping the search and writing the %d file(s) already' % len(covered_now()))
-            print('matched to a key. Run again to keep searching for the rest.')
+            print('Stopped. Recovering the %s file(s) already matched to a key.' % fmt_count(len(covered_now())))
+            print('Run again to keep searching for the rest.')
+        finally:
+            STATUS.disarm_pause()
+        STATUS.live_done()
         covered_all = set()
         for hits in mapping.values():
             covered_all.update(hits)
         unmatched = [f for f in files if f not in covered_all]
+        stopped_early = interrupted or STATUS.gate_declined or (args.max_candidates is not None and tried >= args.max_candidates)
+        if unmatched and mapping:
+            cut = diagnose_damaged(unmatched, list(mapping))
+            if cut:
+                damaged.extend(cut)
+                cut_paths = set(c[0] for c in cut)
+                files = [f for f in files if f not in cut_paths]
+                unmatched = [f for f in unmatched if f not in cut_paths]
+                write_damage_report(None if args.identify else args.dst, damaged, quiet=args.quiet)
+                if not args.quiet:
+                    STATUS.say()
+                    STATUS.say('%s more file(s) are damaged: they start to unlock with a key found here but' % fmt_count(len(cut)))
+                    STATUS.say('the rest is missing (cut short when the attack was interrupted). They are')
+                    STATUS.say('not a key problem. Set aside and listed in %s.' % DAMAGE_REPORT)
         if not mapping:
-            print()
-            print('No key opened any file after %d candidate(s).' % tried)
-            print()
+            STATUS.live_done()
+            STATUS.say()
+            STATUS.say('No key opened any file (%s keys tried).' % fmt_count(tried))
             n_gcm = sum((1 for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))))
             if probed and len(probed) < n_gcm:
-                print('The AES-GCM guesses were checked against %d of the %d AES-GCM' % (len(probed), n_gcm))
-                print('file(s), the smallest ones. Small files are the likeliest to be')
-                print('partial or damaged copies. If you know some files are intact,')
-                print('copy a few of them to a folder and run with --in on that folder.')
-                print()
+                STATUS.tech('The AES-GCM guesses were checked against %d of the %d AES-GCM' % (len(probed), n_gcm))
+                STATUS.tech('file(s), picked from different folders and favouring files over 10 MB.')
+                STATUS.tech('Some of those may be partial or damaged copies. If you know some files are intact,')
+                STATUS.tech('copy a few of them to a folder and run with --in on that folder.')
+            STATUS.tech('The key is a string the operator typed. It is not derived from anything in')
+            STATUS.tech('the file and cannot be read out of the ciphertext. AES-256 is not being attacked.')
             any_ecb = any((ecb_shaped(sizes[f]) for f in files))
-            if not args.brute:
-                print('Next step: re-run with --brute to sweep modelled candidates.')
-            elif not any_ecb:
-                print('Next step: these are all AES-GCM files, where open-ended guessing')
-                print('           is not practical. Best odds: --scavenge FILE on a memory')
-                print('           image, pagefile or hibernation file, or --key / --wordlist')
-                print('           with anything the operators were seen typing.')
-            elif not args.dumb_brute:
-                print('Next step: add --dumb-brute for a plain structural brute, and')
-                print('           --checkpoint FILE so a long run can resume.')
-            else:
-                print('Next step: --deep widens the model, --charset full widens the')
-                print('           brute. Best odds: --scavenge FILE on a memory image,')
-                print('           pagefile or hibernation file, which is where a typed')
-                print('           key most often survives in the clear.')
-            print()
-            print('What this does and does not mean:')
-            print('  * The key is a string the operator typed. It is not derived from')
-            print('    anything in the file and cannot be read out of the ciphertext.')
-            print('    AES-256 itself is not broken here and is not being attacked.')
-            if any((gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f])) for f in files)):
-                print('  * The newer AES-GCM files stretch that typed key through 600,000')
-                print('    PBKDF2 rounds per file, so each guess is slow by design. The')
-                print('    recovered keys (and their variants under --brute) were tried.')
-            print("  * Do not assume the machine's own recovery paths survived. This")
-            print('    crew disables Windows Recovery, Task Manager and Regedit, and')
-            print('    adds a Defender exclusion. Check what is actually left rather')
-            print('    than counting on it.')
-            print('  * Do not wipe the machine and do not delete the encrypted files.')
-            print('    That is what turns a recoverable situation into a permanent one.')
-            print('  * If the machine is still on and infected, the key may still be')
-            print('    in memory. Take it off the network but leave it powered on, and')
-            print('    get a responder to look before anyone reboots it.')
-            print('  * Do not pay. Their decryption is issued from their own bot to the')
-            print('    implant on your machine, so it means keeping the infection alive')
-            print('    and letting their code run again.')
-            print('  * Keep every encrypted file. Mention Chattering Magpies when you')
-            print('    post about this so the case gets picked up faster.')
-            return 2
-        if not args.quiet:
-            print()
+            return report(2, locked=list(unmatched), stopped_early=stopped_early, next_step=next_step_hint(args.brute, args.dumb_brute, any_ecb))
+        STATUS.live_done()
+        STATUS.say()
         for k, hits in mapping.items():
-            print('Key found: %r opens %d/%d files' % (k, len(hits), len(files)))
+            print('FOUND A KEY: %r. It opens %s of %s files.' % (k, fmt_count(len(hits)), fmt_count(len(files))))
         if len(mapping) > 1:
-            covered = sum((len(h) for h in mapping.values()))
-            print()
-            print('%d keys on this set, covering %d/%d files. That is what an' % (len(mapping), covered, len(files)))
-            print('interrupted encryption run looks like: the machine went down part')
-            print('way through and the operators started it again under a new key.')
+            STATUS.say()
+            STATUS.say('%d different keys were needed. That is normal: when an attack is' % len(mapping))
+            STATUS.say('interrupted and started again, the new run uses a new key.')
         if unmatched:
-            print()
-            print('Not covered by any key found: %d file(s).' % len(unmatched))
-        print()
+            STATUS.say()
+            STATUS.say('%s file(s) are not opened by any key found so far.' % fmt_count(len(unmatched)))
     if args.identify:
         covered = set()
         for hits in mapping.values():
             covered.update(hits)
-        print('Keys: %d. Files covered: %d/%d.' % (len(mapping), len(covered), len(files)))
-        for f in [f for f in files if f not in covered][:20]:
-            print('  no key for: %s' % f)
-        return 0
+        any_ecb = any((ecb_shaped(sizes.get(f)) for f in files))
+        return report(0, keys=list(mapping), covered=len(covered), locked=[f for f in files if f not in covered], stopped_early=stopped_early,
+                      next_step=next_step_hint(args.brute, args.dumb_brute, any_ecb))
+    STATUS.stage(4, 'Recovering your files', 'Unlocking each file with the key found and checking the result. Your encrypted\nfiles are not changed; recovered files are saved to a new folder.')
     os.makedirs(long_path(args.dst), exist_ok=True)
     recovered = unverified = failed = 0
+    failed_items = []
+    n_write = len(set(p for hits in mapping.values() for p in hits))
+    show_each = STATUS.verbose or n_write <= 25
+
+    def problem(path, why):
+        STATUS.live_done()
+        reason = plain_reason(why)
+        print('  PROBLEM: %s: %s' % (os.path.basename(path), reason))
+        if STATUS.verbose and why and why != reason:
+            print('           (technical: %s)' % why)
+        failed_items.append((path, reason))
     ext_fixed = 0
     ext_fix_log = []
     handled = set()
@@ -2804,6 +3533,8 @@ def main(argv=None):
             if path in handled:
                 continue
             handled.add(path)
+            if not args.quiet and not show_each:
+                STATUS.live('Recovering files: %s of %s done' % (fmt_count(len(handled)), fmt_count(n_write)))
             scheme = 'auto' if forced else file_scheme.get(path, 'ecb')
             base = mirrored_path(args.dst, path, flat=args.flat)
             tmp = base + '.part'
@@ -2821,7 +3552,7 @@ def main(argv=None):
                         err = 'cannot write: %s' % e
                     if err is not None:
                         _remove_quietly(tmp)
-                        print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
+                        problem(path, err)
                         failed += 1
                         continue
                     verified = True
@@ -2831,12 +3562,12 @@ def main(argv=None):
                 else:
                     pt, verified, err = decrypt_file(path, key_string, verify=not forced, scheme=scheme)
                     if pt is None:
-                        print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
+                        problem(path, err)
                         failed += 1
                         continue
                     allow = args.keep_unverified or (key_string in proven and (not args.strict))
                     if not verified and (not forced) and (not allow):
-                        print('  FAIL   %s  (%s, not written, use --keep-unverified)' % (os.path.basename(path), err or 'unverified'))
+                        problem(path, err or 'unverified')
                         failed += 1
                         continue
                     out_len = len(pt)
@@ -2857,7 +3588,7 @@ def main(argv=None):
                             fh.write(pt)
                     os.replace(long_path(tmp), long_path(dest))
                 except OSError as e:
-                    print('  FAIL   %s  (cannot write: %s)' % (os.path.basename(path), e))
+                    problem(path, 'cannot write: %s' % e)
                     failed += 1
                     _remove_quietly(tmp)
                     continue
@@ -2866,59 +3597,608 @@ def main(argv=None):
                 raise
             if verified:
                 recovered += 1
-                if not args.quiet:
-                    print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, (label or 'unknown type') + ('  [GCM, tag verified]' if scheme == 'gcm' else '')))
+                if not args.quiet and show_each:
+                    if STATUS.verbose:
+                        print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, (label or 'unknown type') + ('  [GCM, tag verified]' if scheme == 'gcm' else '')))
+                    else:
+                        print('  Recovered: %s  (%s, %s)' % (os.path.basename(dest), label or 'unknown type', human_bytes(out_len)))
             elif forced:
                 unverified += 1
-                if not args.quiet:
-                    print('  FORCED %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, label or 'unrecognised type, not structurally checked'))
+                if not args.quiet and show_each:
+                    print('  Saved without checking: %s  (%s, %s)' % (os.path.basename(dest), label or 'unrecognised type', human_bytes(out_len)))
             else:
                 unverified += 1
-                if not args.quiet:
-                    print('  PROVEN %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], out_len, 'key proven on this machine, structure not checked'))
+                if not args.quiet and show_each:
+                    print('  Saved: %s  (%s, key already proven on this machine, contents not checked)' % (os.path.basename(dest), human_bytes(out_len)))
             if fix:
                 ext_fixed += 1
                 ext_fix_log.append((os.path.basename(dest), fix['old'], fix['new'], fix['category']))
-                if not args.quiet:
-                    print('         ^ EXTENSION SWAP FIXED: named .%s, contents are %s (%s). Renamed the recovered copy; corrected from the' % (fix['old'], fix['new'].upper(), fix['category']))
-                    print('           decrypted bytes. Dev7 randomised this extension; your encrypted original is untouched.')
+                if not args.quiet and show_each:
+                    print('    (it was named .%s but is really a .%s file, so the recovered copy was renamed)' % (fix['old'], fix['new']))
+    STATUS.live_done()
     leftover = [f for f in files if f not in handled]
-    print()
-    print('Recovered and verified : %d' % recovered)
-    if unverified:
-        print('Written unverified     : %d%s' % (unverified, '  (forced key, structure not checked)' if forced else '  (proven key, structure not checked, .UNVERIFIED suffix)'))
-    if failed:
-        print('Failed                 : %d' % failed)
-    if ext_fixed:
-        print('Extension swaps fixed  : %d' % ext_fixed)
-    if leftover:
-        print('No key found for       : %d' % len(leftover))
-        for f in leftover[:20]:
-            print('    %s' % f)
-        if len(leftover) > 20:
-            print('    ... and %d more' % (len(leftover) - 20))
-    if ext_fixed:
-        print()
-        print('Extension swaps: %d recovered file(s) were saved under an extension' % ext_fixed)
-        print('that did not match their contents. This crew randomises extensions')
-        print('before encrypting (a video named .jpg, an archive named .png), so each')
-        print('was renamed from its decrypted bytes. The rename is on the recovered')
-        print('copy only; your encrypted originals are untouched. Examples:')
+    if ext_fixed and not args.quiet:
+        STATUS.say()
+        STATUS.say('%d recovered file(s) were saved under a different extension than their name had.' % ext_fixed)
+        STATUS.say('This crew changes extensions before encrypting (a video named .jpg, say), so each')
+        STATUS.say('was renamed from its real contents. Only the recovered copy was renamed. Examples:')
         for shown, old, new, category in ext_fix_log[:10]:
-            print('    .%-5s -> .%-5s  %-11s %s' % (old, new, category, shown[:48]))
+            STATUS.say('    .%-5s -> .%-5s  %-11s %s' % (old, new, category, shown[:48]))
         if len(ext_fix_log) > 10:
-            print('    ... and %d more' % (len(ext_fix_log) - 10))
+            STATUS.say('    ... and %d more' % (len(ext_fix_log) - 10))
+    if not args.quiet:
+        STATUS.say()
+        STATUS.say('"Recovered and checked" means the file unlocked and its internal structure checked')
+        STATUS.say('out. Open a few anyway, and keep your encrypted copies until you are satisfied.')
+        if any((s == 'gcm' for s in file_scheme.values())):
+            STATUS.tech('For the newer AES-GCM files, verified means the 128-bit authentication tag')
+            STATUS.tech('matched, which proves the key and every byte.')
+    any_ecb = any((ecb_shaped(sizes.get(f)) for f in files))
+    code = 0 if recovered or unverified else 3
+    return report(code, recovered=recovered, unverified=unverified, locked=leftover, failed=failed_items, keys=list(mapping),
+                  stopped_early=stopped_early, next_step=next_step_hint(args.brute, args.dumb_brute, any_ecb) if leftover else None)
+
+# ---------------------------------------------------------------------------
+# Interactive setup. Run with no arguments on a terminal, the tool asks what
+# to do and builds the argument list that main() would otherwise have been
+# given, so none of the recovery logic is duplicated here. Plain text and
+# numbered menus only: it has to work on a bare Python, in Termux and in the
+# frozen Windows binary. Pass --no-ui, or set UNMICRO_NO_UI, to skip it.
+# ---------------------------------------------------------------------------
+UI_NO_UI_ENV = 'UNMICRO_NO_UI'
+UI_RULE = '-' * 60
+UI_PROGRESS_FILE = 'unmicro-progress.json'
+
+class UiBack(Exception):
+    pass
+
+class UiQuit(Exception):
+    pass
+
+def _ui_input(prompt):
+    return input(prompt)
+
+def ui_is_interactive():
+    if os.environ.get(UI_NO_UI_ENV):
+        return False
+    try:
+        return bool(sys.stdin and sys.stdout and sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+def _ui_read(prompt):
+    try:
+        raw = _ui_input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise UiQuit()
+    raw = raw.strip()
+    if raw.lower() in ('q', 'quit', 'exit'):
+        raise UiQuit()
+    return raw
+
+def parse_selection(text, count):
+    """Parse a multiple choice answer into a list of choice numbers.
+
+    '1+2+4' is the intended form; commas, spaces and ranges ('2-4') are
+    accepted too. 'a' selects everything and 'n' nothing. Raises ValueError
+    with a plain message on anything else. Order is kept, duplicates drop."""
+    t = text.strip().lower()
+    if t in ('a', 'all'):
+        return list(range(1, count + 1))
+    if t in ('n', 'none'):
+        return []
+    out = []
+    for part in re.split(r'[+,\s]+', t):
+        if not part:
+            continue
+        m = re.fullmatch(r'(\d+)-(\d+)', part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                raise ValueError('"%s" is a backwards range' % part)
+            nums = range(lo, hi + 1)
+        elif part.isdigit():
+            nums = [int(part)]
+        else:
+            raise ValueError('"%s" is not a number' % part)
+        for n in nums:
+            if n < 1 or n > count:
+                raise ValueError('%d is not one of the choices (1 to %d)' % (n, count))
+            if n not in out:
+                out.append(n)
+    return out
+
+def _ui_show_options(options):
+    for i, opt in enumerate(options, 1):
+        label, desc = opt[0], opt[1] if len(opt) > 1 else ''
+        print('  %d  %s - %s' % (i, label, desc) if desc else '  %d  %s' % (i, label))
+
+def ui_choose_one(title, options, default=1, help_text=None):
     print()
-    print('Verified means the padding parsed, the length matched, and the file')
-    print('structure checked out: CRCs, terminators and length fields, not just')
-    print('the first few bytes. Open a few anyway, and keep your encrypted')
-    print('copies until you are satisfied.')
-    if any((s == 'gcm' for s in file_scheme.values())):
-        print('For the newer AES-GCM files, verified means the 128-bit')
-        print('authentication tag matched, which proves the key and every byte.')
+    print(title)
+    _ui_show_options(options)
+    while True:
+        raw = _ui_read('Choose [%d]: ' % default)
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print(help_text or 'Type the number of one choice and press Enter.')
+            continue
+        if not raw:
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        print('Please type a number from 1 to %d.' % len(options))
+
+def ui_choose_many(title, options, default=(), help_text=None):
     print()
+    print(title)
+    _ui_show_options(options)
+    shown = '+'.join(str(n) for n in default) if default else 'none'
+    while True:
+        raw = _ui_read('Choose, e.g. 1+3 (Enter = %s, a = all, n = none): ' % shown)
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print(help_text or 'Type the numbers you want joined with +, for example 1+2+4.')
+            continue
+        if not raw:
+            return list(default)
+        try:
+            return parse_selection(raw, len(options))
+        except ValueError as e:
+            print('%s. Try again.' % e)
+
+def _ui_clean_path(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in '"\'':
+        raw = raw[1:-1]
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(raw.strip())))
+
+def ui_ask_path(prompt, kind='any', default=None, allow_blank=False):
+    """Ask for a path. kind: 'dir', 'file' or 'any'. Quotes from drag and
+    drop are stripped. With allow_blank, Enter returns None."""
+    while True:
+        suffix = ' [%s]' % default if default else ''
+        raw = _ui_read('%s%s: ' % (prompt, suffix))
+        low = raw.lower()
+        if low in ('b', 'back'):
+            raise UiBack()
+        if low == '?':
+            print('Type or paste a path. Dragging the item into this window usually pastes it.')
+            continue
+        if not raw:
+            if default:
+                return default
+            if allow_blank:
+                return None
+            print('A path is needed here.')
+            continue
+        path = _ui_clean_path(raw)
+        if kind == 'dir' and not os.path.isdir(path):
+            print('That is not a folder that exists: %s' % path)
+        elif kind == 'file' and not os.path.isfile(path):
+            print('That is not a file that exists: %s' % path)
+        elif kind == 'any' and not os.path.exists(path):
+            print('That does not exist: %s' % path)
+        else:
+            return path
+
+def ui_ask_text(prompt, default=None, allow_blank=False):
+    while True:
+        suffix = ' [%s]' % default if default else ''
+        raw = _ui_read('%s%s: ' % (prompt, suffix))
+        if raw.lower() in ('b', 'back'):
+            raise UiBack()
+        if raw:
+            return raw
+        if default:
+            return default
+        if allow_blank:
+            return None
+        print('Something needs to be typed here.')
+
+def ui_new_state():
+    return {'where': 'machine', 'paths': [], 'level': 'standard', 'keys': [], 'wordlist': None, 'scavenge': [],
+            'model': False, 'structural': False, 'deep': False, 'gpu': False, 'checkpoint': None,
+            'workers': None, 'flat': False, 'overwrite': False, 'keep_unverified': False, 'strict': False,
+            'no_fix_ext': False, 'identify': False, 'out': None}
+
+def ui_build_argv(st):
+    """The argument list main() would take for the answers in st."""
+    a = []
+    where = st['where']
+    paths = st.get('paths') or []
+    if where == 'file' and paths:
+        a += ['--in', paths[0]]
+    elif where == 'folders' and len(paths) == 1:
+        a += ['--in', paths[0], '--recursive']
+    elif where == 'folders' and paths:
+        a += ['--auto']
+        for p in paths:
+            a += ['--scan-root', p]
+    else:
+        a += ['--auto']
+    level = st['level']
+    model, structural, deep, checkpoint = st['model'], st['structural'], st['deep'], st['checkpoint']
+    if level == 'standard':
+        model = True
+    elif level == 'thorough':
+        model = structural = True
+        checkpoint = checkpoint or UI_PROGRESS_FILE
+    if level != 'custom':
+        deep = False
+    if deep:
+        model = True
+    for k in st['keys'] if level == 'custom' else []:
+        a += ['--key', k]
+    if level == 'custom' and st['wordlist']:
+        a += ['--wordlist', st['wordlist']]
+    for p in st['scavenge'] if level == 'custom' else []:
+        a += ['--scavenge', p]
+    if model:
+        a.append('--brute')
+    if structural:
+        a.append('--dumb-brute')
+    if deep:
+        a.append('--deep')
+    if st['gpu']:
+        a.append('--gpu')
+    if checkpoint:
+        a += ['--checkpoint', checkpoint]
+    if st['workers']:
+        a += ['--workers', str(st['workers'])]
+    for flag, key in (('--flat', 'flat'), ('--overwrite', 'overwrite'), ('--keep-unverified', 'keep_unverified'), ('--strict', 'strict'), ('--no-fix-ext', 'no_fix_ext')):
+        if st[key]:
+            a.append(flag)
+    if st['identify']:
+        a.append('--identify')
+    elif st['out'] and st['out'] != DEFAULT_OUT_DIR:
+        a += ['--out', st['out']]
+    return a
+
+def ui_command_line(argv):
+    prog = os.path.basename(sys.executable) if getattr(sys, 'frozen', False) else 'unmicro.py'
+    if WINDOWS:
+        import subprocess
+        return subprocess.list2cmdline([prog] + list(argv))
+    import shlex
+    return ' '.join([prog] + [shlex.quote(x) for x in argv])
+
+def _ui_free_bytes(path):
+    import shutil
+    probe = os.path.abspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free
+    except Exception:
+        return None
+
+_ui_human_bytes = human_bytes
+
+def ui_preview(st):
+    """Print what the chosen places hold. Searching the whole machine is not
+    done here: it can take a long time and run does it anyway."""
+    if st['where'] == 'machine':
+        print('The whole machine will be searched when you run it. That can take a while.')
+        return
+    files = []
+    for p in st['paths']:
+        try:
+            files += collect(p, True)
+        except OSError:
+            pass
+    files = sorted(set(files))
+    sizes = {f: file_size(f) for f in files}
+    good, bad = split_damaged(files, sizes)
+    total = sum((sizes[f] or 0) for f in good)
+    print('Found %d encrypted file(s), %s in total.' % (len(files), _ui_human_bytes(sum((s or 0) for s in sizes.values()))))
+    if bad:
+        print('%d of them %s damaged (empty, cut short or zero-filled) and will be set aside.' % (len(bad), 'looks' if len(bad) == 1 else 'look'))
+    if not files:
+        print('Nothing here ends in %s. Go back and check the location.' % EXT)
+        return
+    if not st['identify']:
+        out = st['out'] or DEFAULT_OUT_DIR
+        free = _ui_free_bytes(out)
+        if free is not None and total and free < total:
+            print('Warning: recovered files need about %s but only %s is free near %s.' % (_ui_human_bytes(total), _ui_human_bytes(free), os.path.abspath(out)))
+
+def ui_step_where(st):
+    options = [('Search this whole machine', 'every drive and user folder'),
+               ('One or more folders I choose', ''),
+               ('A single file', '')]
+    default = {'machine': 1, 'folders': 2, 'file': 3}[st['where']]
+    n = ui_choose_one('Where should I look for your encrypted files?', options, default,
+                      'Option 1 needs no setup and is the right choice if you are not sure. Options 2 and 3 are faster when you know where the files are.')
+    st['where'] = ('machine', 'folders', 'file')[n - 1]
+
+def ui_step_paths(st):
+    if st['where'] == 'file':
+        st['paths'] = [ui_ask_path('Path to the encrypted file', 'file', (st['paths'] or [None])[0])]
+        return
+    paths = []
+    print()
+    print('Folders to search (subfolders are included). Press Enter on a blank line when done.')
+    first = True
+    while True:
+        prompt = 'Folder %d' % (len(paths) + 1)
+        p = ui_ask_path(prompt, 'dir', allow_blank=not first)
+        if p is None:
+            break
+        if p not in paths:
+            paths.append(p)
+        first = False
+    st['paths'] = paths
+
+LEVELS = ('quick', 'standard', 'thorough', 'custom')
+
+def ui_step_level(st):
+    options = [('Quick', 'known keys only, seconds to minutes'),
+               ('Standard', 'adds variants and the fitted model, recommended'),
+               ('Thorough', 'adds structural brute force. Can take hours'),
+               ('Custom', 'choose the pieces yourself')]
+    n = ui_choose_one('How hard should I try to find the key?', options, LEVELS.index(st['level']) + 1,
+                      'The key is a word the attackers typed. Quick tries the ones already recovered. Standard also tries likely variations. Thorough also tries every short string, which only finishes for short keys.')
+    st['level'] = LEVELS[n - 1]
+
+CUSTOM_OPTIONS = [('I have a key (or several)', ''),
+                  ('I have a wordlist file', ''),
+                  ('Search a memory dump, pagefile or strings file for the key', ''),
+                  ('Also try the fitted model of how these operators type keys', ''),
+                  ('Also try structural brute force', 'slow'),
+                  ('Widen every search', 'much slower; needs the fitted model'),
+                  ('Use the GPU', 'needs pyopencl'),
+                  ('Save progress so a long run can resume', '')]
+
+def ui_step_custom(st):
+    picked = []
+    if st['keys']:
+        picked.append(1)
+    if st['wordlist']:
+        picked.append(2)
+    if st['scavenge']:
+        picked.append(3)
+    for flag, n in (('model', 4), ('structural', 5), ('deep', 6), ('gpu', 7)):
+        if st[flag]:
+            picked.append(n)
+    if st['checkpoint']:
+        picked.append(8)
+    chosen = ui_choose_many('Custom: pick any that apply.', CUSTOM_OPTIONS, picked,
+                            'Join the numbers you want with +, for example 1+4+8. Enter with nothing typed keeps the current picks.')
+    st['keys'], st['wordlist'], st['scavenge'] = [], None, []
+    if 1 in chosen:
+        print()
+        print('Type each key and press Enter. Leave a line blank when done.')
+        while True:
+            k = ui_ask_text('Key %d' % (len(st['keys']) + 1), allow_blank=bool(st['keys']))
+            if k is None:
+                break
+            if k not in st['keys']:
+                st['keys'].append(k)
+    if 2 in chosen:
+        st['wordlist'] = ui_ask_path('Path to the wordlist (one key per line)', 'file')
+    if 3 in chosen:
+        print()
+        print('Never point this at an encrypted file. Leave a line blank when done.')
+        while True:
+            p = ui_ask_path('Dump %d' % (len(st['scavenge']) + 1), 'file', allow_blank=bool(st['scavenge']))
+            if p is None:
+                break
+            st['scavenge'].append(p)
+    st['model'] = 4 in chosen
+    st['structural'] = 5 in chosen
+    st['deep'] = 6 in chosen
+    st['gpu'] = 7 in chosen
+    if st['deep'] and not st['model']:
+        print('Widening needs the fitted model, so it has been added.')
+        st['model'] = True
+    st['checkpoint'] = (ui_ask_text('Progress file', st['checkpoint'] or UI_PROGRESS_FILE) if 8 in chosen else None)
+
+def ui_step_load(st):
+    cpus = os.cpu_count() or 1
+    options = [('All %d cores' % cpus, 'fastest'), ('Half the cores', 'keeps the machine usable'), ('One core', 'slowest, least disruptive')]
+    cur = st['workers']
+    default = 1 if not cur else (3 if cur == 1 else 2)
+    n = ui_choose_one('How much of this machine can I use?', options, default,
+                      'More cores finds the key sooner. Choose fewer if you need to keep using the computer.')
+    st['workers'] = (None, max(1, cpus // 2), 1)[n - 1]
+
+OUTPUT_OPTIONS = [('Only find the key, write nothing', ''),
+                  ('Put everything in one flat folder', ''),
+                  ('Overwrite files that already exist', ''),
+                  ('Also write files that failed verification', 'marked .UNVERIFIED'),
+                  ('Never write anything that failed verification', ''),
+                  ('Do not correct swapped file extensions', '')]
+
+def ui_step_options(st):
+    picked = [n for n, key in ((1, 'identify'), (2, 'flat'), (3, 'overwrite'), (4, 'keep_unverified'), (5, 'strict'), (6, 'no_fix_ext')) if st[key]]
+    while True:
+        chosen = ui_choose_many('Output options (optional). Pick any that apply, or press Enter to keep the defaults.', OUTPUT_OPTIONS, picked,
+                                'The defaults are safe: files are recovered into a new folder, mirrored paths, and extension mix-ups are repaired.')
+        if 4 in chosen and 5 in chosen:
+            print('Options 4 and 5 contradict each other. Pick one.')
+            picked = chosen
+            continue
+        break
+    for n, key in ((1, 'identify'), (2, 'flat'), (3, 'overwrite'), (4, 'keep_unverified'), (5, 'strict'), (6, 'no_fix_ext')):
+        st[key] = n in chosen
+
+def ui_step_out(st):
+    if st['identify']:
+        return
+    st['out'] = ui_ask_text('Folder to save recovered files into', st['out'] or DEFAULT_OUT_DIR)
+
+UI_STEPS = [('where', ui_step_where, None),
+            ('paths', ui_step_paths, lambda st: st['where'] != 'machine'),
+            ('level', ui_step_level, None),
+            ('custom', ui_step_custom, lambda st: st['level'] == 'custom'),
+            ('load', ui_step_load, None),
+            ('options', ui_step_options, None),
+            ('out', ui_step_out, None)]
+
+def ui_review(st):
+    """Show the settings and ask whether to run. Returns 'run', 'edit' or
+    'cancel'."""
+    argv = ui_build_argv(st)
+    print()
+    print(UI_RULE)
+    print('Ready to go')
+    print(UI_RULE)
+    where = {'machine': 'the whole machine', 'folders': '; '.join(st['paths']), 'file': ''.join(st['paths'])}[st['where']]
+    print('Look in        : %s' % where)
+    print('Effort         : %s' % st['level'].capitalize())
+    if st['level'] == 'custom':
+        parts = []
+        if st['keys']:
+            parts.append('%d supplied key(s)' % len(st['keys']))
+        if st['wordlist']:
+            parts.append('wordlist')
+        if st['scavenge']:
+            parts.append('%d dump(s) to search' % len(st['scavenge']))
+        for flag, label in (('model', 'fitted model'), ('structural', 'structural brute force'), ('deep', 'widened'), ('gpu', 'GPU')):
+            if st[flag]:
+                parts.append(label)
+        print('Custom pieces  : %s' % (', '.join(parts) or 'known keys only'))
+    print('Cores          : %s' % ('all' if not st['workers'] else st['workers']))
+    print('Output         : %s' % ('nothing written (key search only)' if st['identify'] else os.path.abspath(st['out'] or DEFAULT_OUT_DIR)))
+    ui_preview(st)
+    print()
+    print('Same thing from the command line:')
+    print('  ' + ui_command_line(argv))
+    if not os.environ.get(LICENSE_ENV):
+        print()
+        print('You will be asked for your license key next.')
+    n = ui_choose_one('Go ahead?', [('Run now', ''), ('Change something', 'start again with these answers kept'), ('Cancel', 'nothing is changed')], 1,
+                      'Run now starts the search. Nothing is written until a key is found and a file verifies.')
+    return ('run', 'edit', 'cancel')[n - 1]
+
+_UI_TEMP_LISTS = []
+
+def _ui_cleanup_temp():
+    while _UI_TEMP_LISTS:
+        _remove_quietly(_UI_TEMP_LISTS.pop())
+
+LOCATION_FLAGS_WITH_VALUE = ('--in', '--scan-root', '--file-list')
+LOCATION_FLAGS = ('--auto', '--recursive')
+
+def ui_retry_argv(argv, locked, harder):
+    """Arguments for a second attempt on just the files still locked. harder
+    raises the effort one level; None means it is already at the top."""
+    import tempfile
+    base = []
+    skip = False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        if tok in LOCATION_FLAGS_WITH_VALUE:
+            skip = True
+            continue
+        if tok in LOCATION_FLAGS:
+            continue
+        base.append(tok)
+    if harder:
+        if '--dumb-brute' in base:
+            if '--deep' in base:
+                return None
+            base.append('--deep')
+            if '--brute' not in base:
+                base.append('--brute')
+        elif '--brute' in base:
+            base.append('--dumb-brute')
+            if '--checkpoint' not in base:
+                base += ['--checkpoint', UI_PROGRESS_FILE]
+        else:
+            base.append('--brute')
+    fd, path = tempfile.mkstemp(prefix='unmicro-locked-', suffix='.txt')
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(locked) + '\n')
+    _UI_TEMP_LISTS.append(path)
+    return ['--file-list', path] + base
+
+def ui_next_steps(argv):
+    """After a run started from the menu, offer what to do about files that
+    are still locked. Returns a new argument list for main(), or None to
+    finish."""
+    res = dict(RESULT)
+    locked = res.get('locked') or []
+    if not locked or res.get('identify'):
+        return None
+    print()
+    print('%s file(s) are still locked.' % fmt_count(len(locked)))
+    options = [('Try again, harder, on just those files', 'keeps what is already recovered'),
+               ('Try again with a key I have', ''),
+               ('Finish', '')]
+    while True:
+        try:
+            n = ui_choose_one('What would you like to do next?', options, 1,
+                              'Trying again only looks at the files still locked, so nothing already recovered is repeated.')
+        except (UiBack, UiQuit):
+            return None
+        if n == 3:
+            return None
+        if n == 2:
+            try:
+                key = ui_ask_text('Key')
+            except (UiBack, UiQuit):
+                continue
+            new = ui_retry_argv(argv, locked, harder=False)
+            return new + ['--key', key]
+        new = ui_retry_argv(argv, locked, harder=True)
+        if new is None:
+            print('This is already the hardest search. Try a key you know, or search a memory')
+            print('dump for the key (run with --scavenge FILE).')
+            continue
+        return new
+
+def run_ui():
+    """Walk the setup screens. Returns an argument list for main(), or None
+    when the user cancels."""
+    st = ui_new_state()
+    print('Dev7 / Micro decryptor (unmicro) %s' % VERSION)
     print('Rho-9 Systems. Your first line of unusual defense.')
-    return 0 if recovered or unverified else 3
+    print()
+    print('Your encrypted files are never changed, renamed or deleted.')
+    print('Everything recovered is written to a separate folder.')
+    print('At any prompt: ? for help, b to go back, q to quit.')
+    i = 0
+    try:
+        while True:
+            while i < len(UI_STEPS):
+                name, fn, applies = UI_STEPS[i]
+                if applies is not None and not applies(st):
+                    i += 1
+                    continue
+                try:
+                    fn(st)
+                except UiBack:
+                    i -= 1
+                    while i > 0 and UI_STEPS[i][2] is not None and not UI_STEPS[i][2](st):
+                        i -= 1
+                    i = max(i, 0)
+                    continue
+                i += 1
+            try:
+                verdict = ui_review(st)
+            except UiBack:
+                verdict = 'edit'
+            if verdict == 'run':
+                return ui_build_argv(st)
+            if verdict == 'cancel':
+                print('Cancelled. Nothing was changed.')
+                return None
+            i = 0
+    except UiQuit:
+        print()
+        print('Cancelled. Nothing was changed.')
+        return None
 
 def alone_on_console(attached, frozen):
     """True when nothing but this program is attached to its console, which

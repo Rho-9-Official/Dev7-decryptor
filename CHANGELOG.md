@@ -2,6 +2,67 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## Unreleased
+
+Damaged copies from interrupted encryption runs no longer break the file
+picker. The malware writes a new `.cryptedmicro` copy and then deletes the
+original, so a run that was cut short leaves stubs and half-written files.
+On a machine with many of them, the smallest files were chosen as probes,
+and a probe that can never open hides the key from the whole sweep.
+
+### Changed: plain-language progress and results
+- Output is now five numbered steps (finding files, checking files, looking
+  for the key, recovering files, results), so it is always clear which part
+  of the job is running.
+- A live status line shows the method in use ("method 2 of 3"), how many keys
+  have been tried and the time elapsed, and says so when slow is normal.
+- The final report puts every file in exactly one row: recovered, damaged
+  (not a key issue), still locked (needs a key), or had a problem. It opens
+  with a one-line verdict such as `PARTLY RECOVERED` and a plain "Next:" hint.
+  This is how to tell a new key from corrupted files at a glance.
+- `--verbose` brings back the technical detail; `--quiet` prints the minimum.
+  Output is plain ASCII.
+
+### Added: pause, retry and file lists
+- Ctrl+C opens a pause menu (keep searching, stop and recover what is matched,
+  or quit) instead of killing the run.
+- After a run started from the menu, a next-steps menu offers to retry only
+  the files still locked, at the same or a harder level.
+- `--file-list FILE` works on the paths listed in FILE instead of searching.
+
+### Added
+- **Damaged-copy screen.** Before any probe is chosen, files that cannot be a
+  whole ciphertext are set aside: zero-byte files, lengths that are neither a
+  whole number of AES blocks nor long enough for AES-GCM (under 44 bytes),
+  files whose first block is all zeros, and files ending in a run of 32 or
+  more zero bytes. These checks are exact or near impossible to trip by
+  chance on real ciphertext.
+- **Cut-short detection once a key is known.** A file no key opened, whose
+  first block decrypts to a recognised file signature (three bytes or more)
+  under a key found on the same machine, is a real encryption that was cut
+  short. It is excluded and reported rather than counted as "no key found".
+- **`corrupted-files.txt`** is written to the output folder, listing every
+  excluded file with its size and the reason. Nothing is deleted or changed.
+  With `--identify`, nothing is written and the list is only printed.
+- **Better probe choice.** Key guesses used to be tested against the smallest
+  files, which are the likeliest to be stubs or fragments. Probes now come from
+  files of 10 MB or more where there are any (up to 256 MB), spread across the
+  size range rather than clustered at one end, and never two from the same
+  folder unless 60% or more of all files share one folder. If fewer than two
+  probes can be found that way, the folder rule is relaxed so a run is never
+  left without a probe. With no file over 10 MB the same spreading applies to
+  smaller files. The pure-python back end keeps to tiny probes, since it
+  cannot run AES over megabytes per guess.
+- **Large GCM probes are streamed.** A probe over 16 MB is read from disk for
+  each guess instead of being held in memory.
+- **Interactive menu.** Run with no options on a terminal and the tool asks
+  where the files are, how hard to try, how many cores to use, output options
+  and where to save, then shows a review screen with the equivalent command
+  line before it starts. Choices that combine take `+`-joined answers (`1+2+4`);
+  commas, spaces and ranges also work. Plain text only. `--no-ui` or
+  `UNMICRO_NO_UI=1` skips it and keeps the old no-options full-auto run, and
+  scripts and CI are unaffected because the menu only opens on a terminal.
+
 ## 3.8.2
 
 Edge-case fixes. A double-click (full-auto) run could report 0 hits on files
