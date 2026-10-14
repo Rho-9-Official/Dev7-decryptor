@@ -437,11 +437,14 @@ and the structural brute to the older files, where they finish in a sensible
 time. The GPU path is not used for GCM.
 
 Because a GCM guess is so expensive, each one is checked against two files at
-a time, starting with the smallest, and a key that opens one of them is then
-tried on every other file. The smallest files are also the likeliest to be
-partial copies left by an interrupted encryption run, so if the supplied and
-recovered keys open neither of the first two, they are tried on the next two,
-and so on through up to 16 files. When nothing opens at all, the output says
+a time, and a key that opens one of them is then tried on every other file.
+Those probe files are chosen to be unlikely to be damaged: files of 10 MB or
+more where there are any (up to 256 MB), spread across the size range, and
+never two from the same folder unless 60% or more of the files live in one
+folder. Large probes are streamed from disk rather than held in memory. Files
+left by an interrupted encryption run are also screened out first. If the
+supplied and recovered keys open neither of the first two, they are tried on
+the next two, and so on through up to 16 files. When nothing opens at all, the output says
 how many of the GCM files were actually tested. If you know some files are
 intact, running `--in` on a folder of just those is the quickest check.
 

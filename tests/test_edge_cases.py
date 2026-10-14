@@ -358,5 +358,126 @@ class DamagedCopies(Base):
         self.assertIsNone(unmicro.write_damage_report(None, bad, quiet=True))
 
 
+MB = 1024 * 1024
+
+
+class ProbeSelection(Base):
+    """Probes come from files of 10 MB or more, spread across sizes, and
+    never two from one folder unless 60% of the files share a folder."""
+
+    def entries(self, spec):
+        # spec: {directory: [size, ...]} -> [(size, path)] with fake paths
+        out = []
+        for d, sizes in spec.items():
+            for i, size in enumerate(sizes):
+                out.append((size, '/%s/f%d_%d.cryptedmicro' % (d, size, i)))
+        return out
+
+    def pick(self, spec, want, **kw):
+        ents = self.entries(spec)
+        same = unmicro.dominant_directory_share([p for _, p in ents]) >= unmicro.PROBE_DOMINANT_DIR
+        return unmicro.select_probes(ents, want, same, unmicro.PROBE_MIN_BYTES, unmicro.PROBE_MAX_BYTES, **kw)
+
+    def dirs(self, paths):
+        return [os.path.dirname(p) for p in paths]
+
+    def test_floor_preferred_over_small_files(self):
+        spec = {'a': [4000, 11 * MB], 'b': [5000, 30 * MB], 'c': [9000, 60 * MB]}
+        got = self.pick(spec, 3)
+        self.assertEqual(sorted(os.path.basename(p).split('_')[0] for p in got), ['f11534336', 'f31457280', 'f62914560'])
+
+    def test_one_per_folder_when_no_folder_dominates(self):
+        spec = {'a': [20 * MB, 21 * MB, 22 * MB], 'b': [23 * MB, 24 * MB], 'c': [25 * MB, 26 * MB]}
+        got = self.pick(spec, 3)
+        self.assertEqual(len(set(self.dirs(got))), 3)
+
+    def test_same_folder_allowed_when_60_percent_share_it(self):
+        spec = {'a': [20 * MB, 21 * MB, 22 * MB, 23 * MB, 24 * MB, 25 * MB], 'b': [26 * MB], 'c': [27 * MB]}
+        # 6 of 8 files (75%) in /a, so more than one probe may come from it.
+        self.assertGreaterEqual(unmicro.dominant_directory_share(p for _, p in self.entries(spec)), 0.6)
+        got = self.pick(spec, 5)
+        self.assertEqual(len(got), 5)
+        self.assertGreater(self.dirs(got).count('/a'), 1)
+
+    def test_not_dominant_stays_strict_beyond_minimum(self):
+        spec = {'a': [20 * MB, 21 * MB], 'b': [22 * MB, 23 * MB], 'c': [24 * MB, 25 * MB]}
+        self.assertLess(unmicro.dominant_directory_share(p for _, p in self.entries(spec)), 0.6)
+        got = self.pick(spec, 6, min_probes=2)
+        self.assertEqual(len(got), 3)
+        self.assertEqual(len(set(self.dirs(got))), 3)
+
+    def test_minimum_guard_relaxes_folder_rule_for_two_folders(self):
+        spec = {'a': [20 * MB, 21 * MB], 'b': [22 * MB, 23 * MB]}
+        got = self.pick(spec, 4, min_probes=4)
+        self.assertEqual(len(got), 4)
+
+    def test_falls_back_to_small_files_and_spreads_sizes(self):
+        spec = {'a': [1000], 'b': [2000], 'c': [3000], 'd': [4000], 'e': [5000]}
+        got = self.pick(spec, 3)
+        sizes = sorted(int(os.path.basename(p).split('_')[0][1:]) for p in got)
+        self.assertEqual(len(got), 3)
+        self.assertNotEqual(sizes, [1000, 2000, 3000])
+        self.assertIn(3000, sizes)
+
+    def test_oversize_file_is_last_resort(self):
+        spec = {'a': [10 * MB], 'b': [unmicro.PROBE_MAX_BYTES + MB], 'c': [5000]}
+        got = self.pick(spec, 3)
+        names = [os.path.basename(p).split('_')[0] for p in got]
+        self.assertEqual(names[0], 'f%d' % (10 * MB))
+        self.assertEqual(names[-1], 'f%d' % (unmicro.PROBE_MAX_BYTES + MB))
+
+    def test_picks_are_spread_across_size_range_not_largest(self):
+        spec = {'d%d' % i: [(10 + i * 10) * MB] for i in range(9)}
+        got = self.pick(spec, 3)
+        sizes = sorted(int(os.path.basename(p).split('_')[0][1:]) // MB for p in got)
+        self.assertEqual(sizes[1], 50)
+        self.assertLess(sizes[0], 50)
+        self.assertGreater(sizes[2], 50)
+
+    def test_pure_python_keeps_probes_tiny(self):
+        saved = unmicro.BACKEND
+        try:
+            unmicro.BACKEND = 'pure-python'
+            self.assertEqual(unmicro.probe_size_bounds(), (0, unmicro.PURE_PROBE_MAX_BYTES))
+        finally:
+            unmicro.BACKEND = saved
+        self.assertEqual(unmicro.probe_size_bounds(), (unmicro.PROBE_MIN_BYTES, unmicro.PROBE_MAX_BYTES))
+
+    def sparse(self, rel, size):
+        path = self.p(*rel.split('/'))
+        with open(path, 'wb') as fh:
+            fh.write(os.urandom(16))
+            fh.truncate(size)
+        return path
+
+    def test_gcm_probe_order_uses_large_files_from_different_folders(self):
+        big = [self.sparse('d%d/big.cryptedmicro' % i, (12 + i) * MB) for i in range(4)]
+        small = [self.sparse('d%d/small%d.cryptedmicro' % (i, j), 3000 + j) for i in range(4) for j in range(3)]
+        order = unmicro.gcm_probe_order(sorted(big + small))
+        first_four = order[:4]
+        self.assertEqual(sorted(first_four), sorted(big))
+        self.assertEqual(len(set(os.path.dirname(p) for p in first_four)), 4)
+
+    def test_ecb_probe_set_prefers_large_and_avoids_repeat_folder(self):
+        a1 = self.sparse('x/a_big.cryptedmicro', 12 * MB)
+        a2 = self.sparse('x/a_small.cryptedmicro', 2000)
+        b1 = self.sparse('y/b_big.cryptedmicro', 13 * MB)
+        c1 = self.sparse('z/c_big.cryptedmicro', 14 * MB)
+        for path, blk in ((a1, b'A' * 16), (a2, b'A' * 16), (b1, b'B' * 16), (c1, b'C' * 16)):
+            with open(path, 'r+b') as fh:
+                fh.write(blk)
+        probes = unmicro.probe_set([a1, a2, b1, c1])
+        paths = [p for _, p in probes]
+        self.assertEqual(sorted(paths), sorted([a1, b1, c1]))
+
+    def test_big_gcm_probe_is_streamed_and_still_finds_the_key(self):
+        big = self.p('only', 'big.jpg.cryptedmicro')
+        make_gcm(big, KEY, jpeg(unmicro.GCM_STREAM_ABOVE + MB))
+        mapping, _, remaining = unmicro.find_all_gcm_keys([big], supplied('nope', KEY), quiet=True)
+        self.assertEqual(mapping.get(KEY), [big])
+        self.assertEqual(remaining, [])
+        self.assertIsNone(unmicro._GCM_PROBE_CACHE[big][2])
+
+
 if __name__ == '__main__':
     unittest.main()

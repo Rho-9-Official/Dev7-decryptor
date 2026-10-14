@@ -51,6 +51,20 @@ GCM_PROBES = 2
 GCM_ROTATE_FILES = 16
 GCM_ROTATE_TIERS = ('supplied keys', 'recovered operator keys')
 GCM_PROBE_CACHE_CAP = 4
+# Probe choice. Probes are the files every key guess is tested against. They
+# are taken from files of at least PROBE_MIN_BYTES where there are enough,
+# spread across sizes and across folders: never two from one folder unless
+# PROBE_DOMINANT_DIR of all files already live in one. A run that was cut
+# short damages files in the folder it was working through, so probes from
+# several folders are unlikely to all be hit. PROBE_MAX_BYTES keeps a
+# multi-gigabyte file from being chosen, since confirming a key reads the
+# whole probe. GCM probes over GCM_STREAM_ABOVE are streamed from disk per
+# guess rather than held in memory.
+PROBE_MIN_BYTES = 10 * 1024 * 1024
+PROBE_MAX_BYTES = 256 * 1024 * 1024
+PROBE_DOMINANT_DIR = 0.60
+PURE_PROBE_MAX_BYTES = 65536
+GCM_STREAM_ABOVE = 16 * 1024 * 1024
 # Tiers cheap enough to run in both formats before any open-ended search, so
 # a block-aligned GCM file is not left waiting behind the ECB brute.
 QUICK_TIERS = ('supplied keys', 'wordlist', 'recovered operator keys', 'scavenged strings')
@@ -1682,6 +1696,70 @@ def build_plan(brute=False, deep=False, dumb=False, extra=None, wordlist=None, s
             plan.append(('structural brute len=%d' % length, lambda L=length, A=alpha: get_model().gen_dumb_len(L, alphabet=A)))
     return plan
 
+def probe_size_bounds():
+    """(floor, ceiling) in bytes for the files used as key probes. A large
+    file is far less likely to be a stub or a stray fragment than the
+    smallest one in the set. The pure-python back end cannot afford to run
+    AES over megabytes per guess, so it keeps to tiny probes."""
+    if BACKEND == 'pure-python':
+        return (0, PURE_PROBE_MAX_BYTES)
+    return (PROBE_MIN_BYTES, PROBE_MAX_BYTES)
+
+def _dir_of(path):
+    return os.path.normcase(os.path.dirname(path))
+
+def dominant_directory_share(paths):
+    """Fraction of the files that sit in the single busiest folder."""
+    paths = list(paths)
+    if not paths:
+        return 0.0
+    counts = collections.Counter(_dir_of(p) for p in paths)
+    return max(counts.values()) / float(len(paths))
+
+def _quantile_targets():
+    # 0.5, 0.25, 0.75, 0.125, 0.625, ... so successive picks land at
+    # different points of the size range rather than clustering at one end.
+    yield 0.5
+    denom = 4
+    while True:
+        for num in range(1, denom, 2):
+            yield num / float(denom)
+        denom *= 2
+
+def select_probes(entries, want, same_dir_ok, lo, hi, min_probes=1, avoid_dirs=None):
+    """Choose up to want probe files from entries, [(size, path)].
+
+    Files whose size is inside [lo, hi] come first, then smaller ones, then
+    larger ones. Inside a size band the picks are spread across the size
+    range. Two probes are never taken from the same folder, unless
+    same_dir_ok (60% or more of all files share one folder, so spreading is
+    not possible) or fewer than min_probes could otherwise be found, so a
+    run with only a couple of folders is not left without a probe. Folders
+    in avoid_dirs count as already used."""
+    ents = sorted(entries, key=lambda e: (e[0], e[1]))
+    tiers = [[e for e in ents if lo <= e[0] <= hi], [e for e in ents if e[0] < lo], [e for e in ents if e[0] > hi]]
+    chosen = []
+    taken = set()
+    used = set(avoid_dirs or ())
+
+    def run(dir_rule):
+        for tier in tiers:
+            targets = _quantile_targets()
+            while len(chosen) < want:
+                avail = [i for i, e in enumerate(tier) if e[1] not in taken and not (dir_rule and _dir_of(e[1]) in used)]
+                if not avail:
+                    break
+                aim = next(targets) * (len(tier) - 1)
+                i = min(avail, key=lambda j: (abs(j - aim), j))
+                path = tier[i][1]
+                chosen.append(path)
+                taken.add(path)
+                used.add(_dir_of(path))
+    run(True)
+    if len(chosen) < want and (same_dir_ok or len(chosen) < min_probes):
+        run(False)
+    return chosen
+
 def probe_set(files, max_probes=4):
     groups = {}
     for p in files:
@@ -1693,10 +1771,17 @@ def probe_set(files, max_probes=4):
         if len(b) == 16:
             groups.setdefault(b, []).append(p)
     ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    lo, hi = probe_size_bounds()
+    same_dir_ok = dominant_directory_share([p for ps in groups.values() for p in ps]) >= PROBE_DOMINANT_DIR
     out = []
+    used = set()
     for blk, paths in ordered[:max_probes]:
-        smallest = min(paths, key=lambda p: os.path.getsize(p))
-        out.append((blk, smallest))
+        entries = [(file_size(p) or 0, p) for p in paths]
+        pick = select_probes(entries, 1, same_dir_ok, lo, hi, avoid_dirs=used)
+        if not pick:
+            continue
+        used.add(_dir_of(pick[0]))
+        out.append((blk, pick[0]))
     return out
 
 def confirm_key(key_string, path):
@@ -1991,28 +2076,42 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
 # file has its own salt, and every guess costs a 600,000-round PBKDF2 before
 # a single AES block can be tried. In exchange there are no false positives,
 # because the 128-bit tag either matches or it does not. So the search tries
-# a guess against a couple of the smallest files, accepts it only on a tag
-# match, and then maps the found key across the rest. The smallest files are
-# also the likeliest to be partial or damaged, so the bounded tiers move on
-# to the next files when a pair opens to nothing (GCM_ROTATE_FILES).
+# a guess against a couple of probe files (large, spread across sizes and
+# folders, see select_probes), accepts it only on a tag match, and then maps
+# the found key across the rest. A probe can still be partial or damaged, so
+# the bounded tiers move on to the next files when a pair opens to nothing
+# (GCM_ROTATE_FILES).
 _GCM_PROBE_CACHE = collections.OrderedDict()
 
 def gcm_probe_order(files):
-    """GCM-shaped files, smallest first: the order in which they are used
-    as probes."""
-    sized = sorted(((file_size(p), p) for p in files), key=lambda t: (t[0] is None, t[0] or 0))
-    return [p for size, p in sized if gcm_shaped(size)]
+    """GCM-shaped files in the order they are used as probes: files of at
+    least PROBE_MIN_BYTES first where there are any, spread across sizes and
+    across folders (see select_probes). At most GCM_ROTATE_FILES are
+    returned, which is as many as any tier uses."""
+    cands = [(s, p) for s, p in ((file_size(p), p) for p in files) if gcm_shaped(s)]
+    if not cands:
+        return []
+    lo, hi = probe_size_bounds()
+    same_dir_ok = dominant_directory_share([p for _, p in cands]) >= PROBE_DOMINANT_DIR
+    return select_probes(cands, GCM_ROTATE_FILES, same_dir_ok, lo, hi, min_probes=GCM_PROBES)
 
 def _gcm_probe(path):
     """(salt, iv, body, tag) of a probe file, cached per process so a pool
-    worker reads each probe once rather than once per guess."""
+    worker reads each probe once rather than once per guess. For a file over
+    GCM_STREAM_ABOVE, body is None and only the header is cached: the caller
+    streams the body from disk for each guess instead of holding it."""
     hit = _GCM_PROBE_CACHE.get(path)
     if hit is None:
-        with open(long_path(path), 'rb') as fh:
-            data = fh.read()
-        if len(data) < GCM_MIN_LEN:
-            raise ValueError('too short to be an AES-GCM file')
-        hit = (data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:])
+        size = file_size(path)
+        if size is not None and size > GCM_STREAM_ABOVE:
+            _size, salt, iv, tag = gcm_header(path)
+            hit = (salt, iv, None, tag)
+        else:
+            with open(long_path(path), 'rb') as fh:
+                data = fh.read()
+            if len(data) < GCM_MIN_LEN:
+                raise ValueError('too short to be an AES-GCM file')
+            hit = (data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:])
         _GCM_PROBE_CACHE[path] = hit
         if len(_GCM_PROBE_CACHE) > GCM_PROBE_CACHE_CAP:
             _GCM_PROBE_CACHE.popitem(last=False)
@@ -2032,9 +2131,16 @@ def _gcm_worker_chunk(job):
             except (OSError, ValueError):
                 continue
             dk = gcm_kdf(cand, salt)
-            ctx = _gcm_new(dk, iv, tag)
-            ctx.update(body)
-            if ctx.verify():
+            if body is None:
+                psize = file_size(path)
+                if psize is None:
+                    continue
+                opened = gcm_stream(path, psize, iv, tag, dk, keep=False)[1] is None
+            else:
+                ctx = _gcm_new(dk, iv, tag)
+                ctx.update(body)
+                opened = ctx.verify()
+            if opened:
                 hits.append((cand, path, salt, dk))
                 break
     return hits
@@ -2869,8 +2975,8 @@ def main(argv=None):
             n_gcm = sum((1 for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))))
             if probed and len(probed) < n_gcm:
                 print('The AES-GCM guesses were checked against %d of the %d AES-GCM' % (len(probed), n_gcm))
-                print('file(s), the smallest ones. Small files are the likeliest to be')
-                print('partial or damaged copies. If you know some files are intact,')
+                print('file(s), picked from different folders and favouring files over 10 MB.')
+                print('Some of those may be partial or damaged copies. If you know some files are intact,')
                 print('copy a few of them to a folder and run with --in on that folder.')
                 print()
             any_ecb = any((ecb_shaped(sizes[f]) for f in files))

@@ -24,6 +24,17 @@ and a probe that can never open hides the key from the whole sweep.
 - **`corrupted-files.txt`** is written to the output folder, listing every
   excluded file with its size and the reason. Nothing is deleted or changed.
   With `--identify`, nothing is written and the list is only printed.
+- **Better probe choice.** Key guesses used to be tested against the smallest
+  files, which are the likeliest to be stubs or fragments. Probes now come from
+  files of 10 MB or more where there are any (up to 256 MB), spread across the
+  size range rather than clustered at one end, and never two from the same
+  folder unless 60% or more of all files share one folder. If fewer than two
+  probes can be found that way, the folder rule is relaxed so a run is never
+  left without a probe. With no file over 10 MB the same spreading applies to
+  smaller files. The pure-python back end keeps to tiny probes, since it
+  cannot run AES over megabytes per guess.
+- **Large GCM probes are streamed.** A probe over 16 MB is read from disk for
+  each guess instead of being held in memory.
 
 ## 3.8.2
 
