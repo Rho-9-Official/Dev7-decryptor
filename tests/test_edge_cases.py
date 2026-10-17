@@ -795,5 +795,44 @@ class StatusOutput(Base):
         self.assertLess(len(q), len(v))
 
 
+class GeneratorFamilies(unittest.TestCase):
+    """Prefix and mix families, fitted on synthetic keys, no license."""
+
+    def model(self, keys):
+        return unmicro.KeyModel(keys=keys, handles=[], words=[], vocab=[])
+
+    def first(self, gen, n):
+        import itertools
+        return list(itertools.islice(gen, n))
+
+    def test_prefix_family_reaches_held_out_key(self):
+        m = self.model(['27ABCD', '27BACD', '27DCAB', 'zarox'])
+        self.assertIn('27ABDC', self.first(m.gen_prefix(), 2000))
+
+    def test_prefix_alphabet_grows_past_seen_letters(self):
+        m = self.model(['27ABCD', '27BACD', 'XL YZ'])
+        self.assertIn('27ABCL', self.first(m.gen_prefix(), 200000))
+
+    def test_mix_family_reaches_held_out_key(self):
+        m = self.model(['2bo7', '7ob2', 'b2o7'])
+        out = self.first(m.gen_mix(), 20000)
+        self.assertIn('2ob7', out)
+        self.assertFalse(any(c.isalpha() or c.isdigit() for c in out))
+
+    def test_families_empty_without_matching_keys(self):
+        m = self.model(['zarox', 'key3131'])
+        self.assertEqual(self.first(m.gen_prefix(), 5), [])
+        self.assertEqual(self.first(m.gen_mix(), 5), [])
+
+    def test_interleaved_includes_new_families(self):
+        from unittest import mock
+        m = self.model(['27ABCD', '2bo7'])
+        rows = ['qwertyuiop', 'asdfghjkl', 'zxcvbnm']
+        with mock.patch.object(unmicro, 'KEYBOARD_ROWS', rows):
+            out = set(self.first(m.interleaved(), 50000))
+        self.assertTrue(any(c.startswith('27') and c[2:].isupper() for c in out))
+        self.assertTrue(any(c.isalnum() and not c.isalpha() and not c.isdigit() and c.islower() for c in out))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -284,6 +284,10 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
+          # The release notes name the exact files uploaded, read from dist/
+          # rather than typed in, so they always carry the version number.
+          WIN=$(cd dist && ls unmicro-*-windows-x86_64.exe)
+          LIN=$(cd dist && ls unmicro-*-linux-x86_64)
           cat > notes.md <<'EOF'
           Free decryptor for the **Dev7 / Micro** ransomware family, the files
           renamed to `.cryptedmicro`.
@@ -295,11 +299,11 @@ jobs:
 
           ```
           # Windows
-          unmicro-windows-x86_64.exe --auto --out recovered
+          __WIN__ --auto --out recovered
 
           # Linux
-          chmod +x unmicro-linux-x86_64
-          ./unmicro-linux-x86_64 --auto --out recovered
+          chmod +x __LIN__
+          ./__LIN__ --auto --out recovered
           ```
 
           From 3.7 on, each build needs its own license key. Pass it with
@@ -316,6 +320,11 @@ jobs:
           Check the SHA256 below and the build provenance before running it,
           and do not take an unverified copy from anywhere else.
           EOF
+          sed -i "s/__WIN__/${WIN}/g; s/__LIN__/${LIN}/g" notes.md
+          if grep -q "__WIN__\|__LIN__" notes.md; then
+            echo "release notes still have a placeholder" >&2
+            exit 1
+          fi
           {
             echo
             echo "## SHA256"
