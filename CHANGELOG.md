@@ -2,6 +2,20 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.9.1
+
+Candidate search update. Same license as 3.9.
+
+### Changed
+- **Wider candidate model.** Two more families for keys that mix letters
+  and digits. Each starts from the characters the recovered data uses most
+  and widens one character at a time, so the likeliest guesses come first.
+- **Sealed data refreshed** for this build. The sealed-blob integrity digest
+  changed accordingly; `--self-test` checks the new one.
+- Release notes now name the exact download files, version number
+  included.
+- If an earlier version did not open your files, run this one.
+
 ## 3.9
 
 Damaged copies from interrupted encryption runs no longer break the file
