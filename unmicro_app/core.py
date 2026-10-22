@@ -94,6 +94,30 @@ def self_cmd():
             'from unmicro_app.launcher import main; sys.exit(main())', PKG_PARENT]
 
 
+STOPFILE_ENV = 'UNMICRO_STOP_FILE'
+
+
+def watch_stop_file(unmicro, path):
+    """The window's Stop for the built-in engine: no Ctrl+C. Once the file
+    exists, the engine stops at the end of the current batch exactly as
+    "2  Stop searching and recover the files already matched" would, with
+    no menu shown."""
+    def stop_and_recover():
+        return 2
+
+    def watch():
+        while not os.path.exists(path):
+            time.sleep(0.5)
+        try:
+            sys.stderr.write('\nStop requested: stopping at the end of the current batch, then recovering the files already matched.\n')
+            sys.stderr.flush()
+        except Exception:
+            pass
+        unmicro.STATUS.pause_menu = stop_and_recover
+        unmicro.STATUS.pause_requested = True
+    threading.Thread(target=watch, daemon=True, name='stop-request').start()
+
+
 def run_engine(args, hold_allowed=True):
     """Run the built-in engine exactly as the standalone unmicro binary
     did: the same console set-up, error report and window hold.
@@ -111,6 +135,9 @@ def run_engine(args, hold_allowed=True):
         except Exception:
             pass
     unmicro.setup_console()
+    stop_file = os.environ.pop(STOPFILE_ENV, None)  # popped: the worker processes don't watch
+    if stop_file:
+        watch_stop_file(unmicro, stop_file)
     hold = hold_allowed and unmicro.launched_by_double_click()
     sys.argv = [sys.argv[0]] + list(args)  # main() reads sys.argv (and opens its menu when there are none)
     try:
@@ -1301,12 +1328,20 @@ class Job(object):
     """A running unmicro with a terminal on stdin. Output arrives on
     self.q as ('out'|'err'|'exit', text|code)."""
 
-    def __init__(self, argv, env, cwd=None):
+    def __init__(self, argv, env, cwd=None, builtin=False):
+        """builtin: argv runs the built-in engine, which stops on request
+        through a stop file; any other engine is sent Ctrl+C."""
         self.argv = argv
         self.q = queue.Queue()
         self.proc = None
         self.master = None
         env = dict(env)
+        self.stopfile = None
+        if builtin:
+            fd, self.stopfile = tempfile.mkstemp(prefix='unmicro-stop-')
+            os.close(fd)
+            os.unlink(self.stopfile)   # the engine stops once it exists
+            env[STOPFILE_ENV] = self.stopfile
         env['PYTHONUNBUFFERED'] = '1'
         env['PYTHONIOENCODING'] = 'utf-8'
         env.pop('UNMICRO_NO_UI', None)
@@ -1371,11 +1406,12 @@ class Job(object):
 
     def _wait(self):
         rc = self.proc.wait()
-        if getattr(self, 'pidfile', None):
-            try:
-                os.unlink(self.pidfile)
-            except OSError:
-                pass
+        for f in (getattr(self, 'pidfile', None), self.stopfile):
+            if f:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
         for t in self._readers:
             t.join(5)
         if self.master is not None:
@@ -1401,9 +1437,17 @@ class Job(object):
             return False
 
     def interrupt(self):
-        """What Ctrl+C at the keyboard does: unmicro pauses and asks."""
+        """Ask unmicro to stop and recover the files already matched. The
+        built-in engine is asked through its stop file; any other engine
+        gets what Ctrl+C at the keyboard does (it pauses and asks)."""
         if not self.running():
             return False
+        if self.stopfile:
+            try:
+                open(self.stopfile, 'w').close()
+                return True
+            except OSError:
+                return False
         if WINDOWS:
             return self._win_send('ctrlc')
         import signal

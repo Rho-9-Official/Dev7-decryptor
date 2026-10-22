@@ -1584,7 +1584,7 @@ def run_gui():
         len_bar.setValue(0)
         len_l.setText('')
         try:
-            job = Job(argv, env, cwd=s['out'] if s['out'] and os.path.isdir(s['out']) else None)
+            job = Job(argv, env, cwd=s['out'] if s['out'] and os.path.isdir(s['out']) else None, builtin=e.path == BUILTIN)
             job.start()
         except Exception as ex:
             message('Could not start unmicro', str(ex), 'danger')
@@ -1770,9 +1770,9 @@ def run_gui():
         state['pending_stop'] = True
         state['stop_sent'] = time.time()
         set_run_chip('Stopping…', C['warning'])
-        gui_note('sending Ctrl+C: unmicro pauses at the end of the current batch (a few seconds)')
+        gui_note('asking unmicro to stop at the end of the current batch (a few seconds), then recover the files already matched')
         if not job.interrupt():
-            gui_note('could not deliver Ctrl+C; use Force stop')
+            gui_note('could not ask unmicro to stop; use Force stop')
 
     def kill_run(confirm=True):
         job = state['job']

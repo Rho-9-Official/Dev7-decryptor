@@ -235,6 +235,31 @@ class Shared(unittest.TestCase):
         g.save_config(path, cfg(checkpoint='/chosen/file.ckpt'))
         self.assertEqual(json.load(open(path))['checkpoint'], '/chosen/file.ckpt')
 
+    def test_stop_file_asks_the_engine_to_stop_and_recover(self):
+        import tempfile
+        import time
+        import types
+        status = types.SimpleNamespace(pause_requested=False, pause_menu=lambda: 1)
+        engine = types.SimpleNamespace(STATUS=status)
+        path = os.path.join(tempfile.mkdtemp(), 'stop')
+        g.watch_stop_file(engine, path)
+        time.sleep(0.7)
+        self.assertFalse(status.pause_requested)       # nothing until the window asks
+        open(path, 'w').close()
+        for _ in range(30):
+            if status.pause_requested:
+                break
+            time.sleep(0.1)
+        self.assertTrue(status.pause_requested)
+        self.assertEqual(status.pause_menu(), 2)       # 2 = stop and recover the matched files
+
+    def test_job_stop_file_only_for_the_builtin_engine(self):
+        self.assertIsNone(g.Job(['x'], {}).stopfile)
+        j = g.Job(['x'], {}, builtin=True)
+        self.assertTrue(j.stopfile)
+        self.assertEqual(j.env[g.STOPFILE_ENV], j.stopfile)
+        self.assertFalse(os.path.exists(j.stopfile))
+
     def test_keydata_from_list(self):
         kd = g.keydata_from_list('zarox\nab12\n\n')
         self.assertEqual(kd['keys'], ['zarox', 'ab12'])
