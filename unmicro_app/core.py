@@ -102,6 +102,14 @@ def run_engine(args, hold_allowed=True):
     reading that console."""
     import traceback
     import unmicro
+    # Unbuffered when not on a terminal: the window reads this output as it
+    # comes (a built exe ignores PYTHONUNBUFFERED).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            pass
     unmicro.setup_console()
     hold = hold_allowed and unmicro.launched_by_double_click()
     sys.argv = [sys.argv[0]] + list(args)  # main() reads sys.argv (and opens its menu when there are none)
@@ -127,6 +135,28 @@ def run_engine(args, hold_allowed=True):
     return code
 
 
+def win_route_ctrl_c():
+    """Windows only. Make Ctrl+C on this process's console reach Python's
+    SIGINT handling (the engine's pause menu). A windowed program that gets
+    its console after Python started never has Ctrl+C routed to Python, so
+    Windows' default action ends the process instead."""
+    import ctypes
+    import signal
+    import _thread
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def on_ctrl(event):
+        if event == 0:  # CTRL_C_EVENT
+            _thread.interrupt_main(signal.SIGINT)
+            return True
+        return False
+    win_route_ctrl_c.handler = handler_type(on_ctrl)  # kept alive for the process's lifetime
+    k32.SetConsoleCtrlHandler(None, False)  # Ctrl+C processing on, even if a parent turned it off
+    k32.SetConsoleCtrlHandler(win_route_ctrl_c.handler, True)
+
+
 def win_std_streams(console_in=False, own_console=False):
     """Windows only. A windowed program has no console and may have no
     sys.stdout. own_console: open a console window when nothing was
@@ -148,6 +178,7 @@ def win_std_streams(console_in=False, own_console=False):
         sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
         sys.stderr = sys.stdout
         sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+        win_route_ctrl_c()
         return
     for name, h in (('stdout', out), ('stderr', err)):
         if getattr(sys, name) is None and usable(h):
@@ -155,6 +186,7 @@ def win_std_streams(console_in=False, own_console=False):
             setattr(sys, name, open(fd, 'w', encoding='utf-8', errors='replace', buffering=1, closefd=False))
     if console_in:
         sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+        win_route_ctrl_c()
 
 
 # --------------------------------------------------------------------------
@@ -684,6 +716,7 @@ def finish_snapshot(s, cpu_n):
     0 workers (= unmicro's default, every core) when all cores are chosen."""
     if s.get('checkpoint_on') and not s.get('checkpoint') and s.get('out'):
         s['checkpoint'] = os.path.join(s['out'], 'unmicro-progress.checkpoint')
+        s['checkpoint_derived'] = True   # follows the output folder: never saved as a fixed path
     if (s.get('workers') or 0) >= cpu_n:
         s['workers'] = 0
     return s
@@ -1465,6 +1498,8 @@ def save_config(path, cfg):
     data = dict(cfg)
     if not data.get('remember_license'):
         data['license'] = ''
+    if data.pop('checkpoint_derived', False):
+        data['checkpoint'] = ''
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp'

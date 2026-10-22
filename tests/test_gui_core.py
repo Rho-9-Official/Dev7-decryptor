@@ -222,6 +222,19 @@ class Shared(unittest.TestCase):
         self.assertEqual(s['workers'], 0)
         self.assertEqual(g.finish_snapshot(cfg(workers=4), 12)['workers'], 4)
 
+    def test_derived_checkpoint_is_not_saved(self):
+        import json
+        import tempfile
+        s = g.finish_snapshot(cfg(checkpoint_on=True, checkpoint='', out='/old/out'), 4)
+        self.assertTrue(s['checkpoint'].startswith(os.path.join('/old/out', '')))
+        path = os.path.join(tempfile.mkdtemp(), 's.json')
+        g.save_config(path, s)
+        saved = json.load(open(path))
+        self.assertEqual(saved['checkpoint'], '')
+        self.assertNotIn('checkpoint_derived', saved)
+        g.save_config(path, cfg(checkpoint='/chosen/file.ckpt'))
+        self.assertEqual(json.load(open(path))['checkpoint'], '/chosen/file.ckpt')
+
     def test_keydata_from_list(self):
         kd = g.keydata_from_list('zarox\nab12\n\n')
         self.assertEqual(kd['keys'], ['zarox', 'ab12'])
