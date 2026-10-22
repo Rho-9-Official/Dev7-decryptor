@@ -278,6 +278,12 @@ class Shared(unittest.TestCase):
         g.record_speed(c, [100.0, 300.0, 200.0], 4, False)
         self.assertEqual(c['measured']['per_worker'], 50.0)
 
+    def test_one_version(self):
+        # one program, one version: releases are named from unmicro.py VERSION
+        import unmicro
+        import unmicro_app
+        self.assertEqual(unmicro_app.__version__, unmicro.VERSION)
+
     def test_bird_polygon(self):
         pts = g.bird_polygon(2.0, 1.0, 1.0)
         self.assertEqual(pts[0], (7.0, 29.0))

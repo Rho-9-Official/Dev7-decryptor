@@ -25,7 +25,7 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '3.9.1'
+VERSION = '5.0'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
 # Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the

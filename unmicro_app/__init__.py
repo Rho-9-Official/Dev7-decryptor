@@ -3,4 +3,4 @@
 
 Run it with `python -m unmicro_app`, or the built unmicro-gui.exe.
 """
-__version__ = '0.1.0'
+__version__ = '5.0'  # same as unmicro.py VERSION: one program, one version

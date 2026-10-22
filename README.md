@@ -543,7 +543,7 @@ These are real and are not regressions:
 
 ## What's new
 
-- **One program with a window (unreleased).** unmicro is now a single
+- **One program with a window (5.0).** unmicro is now a single
   download per platform: a window that walks through files, keys, search,
   output and the run, with the engine built in. The command line is inside the
   same file (`--cli`). In endless mode, safety limits on CPU temperature,

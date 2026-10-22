@@ -97,7 +97,8 @@ def main(argv=None):
             win_std_streams(own_console=argv[0] == '--cli')
         return run_engine(argv[1:])
     if argv[:1] in (['--version'], ['-V']):
-        print('unmicro GUI %s%s' % (APP_VERSION, (', engine %s' % engine_version()) if builtin_available() else ''))
+        ev = engine_version() if builtin_available() else None
+        print('unmicro %s' % APP_VERSION if ev in (None, APP_VERSION) else 'unmicro %s (engine %s)' % (APP_VERSION, ev))
         return 0
     cfg_path = os.path.join(config_dir(), 'settings.json')
     cfg = load_config(cfg_path)
