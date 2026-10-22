@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unmicro-gui"
+dynamic = ["version"]
+description = "Desktop front end for unmicro, the Dev7 / Micro (.cryptedmicro) decryptor"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Rho-9 Systems" }]
+dependencies = []
+
+[project.optional-dependencies]
+qt = ["PySide6-Essentials>=6.5"]
+monitor = ["psutil>=5.9"]
+
+[project.gui-scripts]
+unmicro-gui = "unmicro_app.launcher:main"
+
+[tool.setuptools]
+packages = ["unmicro_app"]
+
+[tool.setuptools.dynamic]
+version = { attr = "unmicro_app.__version__" }

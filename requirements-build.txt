@@ -1,0 +1,5 @@
+# Building the one-file exe (versions the Linux build was tested with)
+pyinstaller==6.22.3
+PySide6-Essentials==6.12.0
+pillow==13.0.0
+psutil==5.9.8

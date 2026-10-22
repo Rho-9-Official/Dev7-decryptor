@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""unmicro GUI launcher: pick the PySide6 UI (unmicro_qt) or the Tk UI
-(unmicro_gui), and remember the choice in the settings file.
+"""unmicro GUI launcher: pick the PySide6 UI (qt_ui) or the Tk UI
+(tk_ui), and remember the choice in the settings file.
 
 Falls back to the Tk UI when PySide6 is not installed. Run it with --choose
-to see the menu again, or --qt / --tk to pick for this start only.
+to see the menu again, or --qt / --tk to pick for this start only. This is
+the program's entry point (python -m unmicro_app, and the built exe).
 """
 import os
 import sys
 
-from unmicro_core import C, APP_VERSION, config_dir, helper_main, load_config, save_config
+from .core import C, APP_VERSION, config_dir, helper_main, load_config, save_config
 
 
 def qt_available():
@@ -98,13 +99,14 @@ def main(argv=None):
     else:
         ui = cfg['ui']
     if ui == 'qt' and not has_qt:
-        sys.stderr.write('PySide6 is not installed: using the Tk window.\n')
+        if sys.stderr:  # None in the windowed exe
+            sys.stderr.write('PySide6 is not installed: using the Tk window.\n')
         ui = 'tk'
     if ui == 'qt':
-        import unmicro_qt
-        return unmicro_qt.run_gui() or 0
-    import unmicro_gui
-    unmicro_gui.run_gui()
+        from . import qt_ui
+        return qt_ui.run_gui() or 0
+    from . import tk_ui
+    tk_ui.run_gui()
     return 0
 
 

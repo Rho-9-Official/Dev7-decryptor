@@ -7,7 +7,7 @@ The GUI never decrypts anything itself. It builds an unmicro command line from
 the choices on its tabs, runs the already built binary (or unmicro.py), and
 reads its output. Pure standard library (tkinter), so the same file runs on
 Windows, macOS and Linux. Everything that is not a widget lives in
-unmicro_core, shared with the PySide6 UI (unmicro_qt.py).
+core.py, shared with the PySide6 UI (qt_ui.py).
 
 The binary is driven the way a person at a terminal would drive it: its
 standard input is a terminal (a pty on Linux/macOS, a hidden console on
@@ -23,8 +23,8 @@ import sys
 import threading
 import time
 
-from unmicro_core import *  # noqa: F401,F403  (shared with the Qt UI)
-from unmicro_core import _helper_cmd, helper_main  # noqa: F401
+from .core import *  # noqa: F401,F403  (shared with the Qt UI)
+from .core import helper_main
 
 
 # ==========================================================================

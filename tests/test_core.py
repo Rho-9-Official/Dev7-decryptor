@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-import unmicro_core as g  # noqa: E402
+from unmicro_app import core as g  # noqa: E402
 
 
 def cfg(**kw):
@@ -273,6 +273,22 @@ class Shared(unittest.TestCase):
         c = {}
         g.record_speed(c, [100.0, 300.0, 200.0], 4, False)
         self.assertEqual(c['measured']['per_worker'], 50.0)
+
+    def test_bundled_engine_path_not_saved(self):
+        import json
+        import tempfile
+        d = tempfile.mkdtemp()
+        sys._MEIPASS = os.path.join(d, '_MEI1')
+        try:
+            path = os.path.join(d, 's.json')
+            g.save_config(path, {'engine': os.path.join(sys._MEIPASS, 'engine', 'unmicro'), 'license': 'K'})
+            saved = json.load(open(path))
+            self.assertEqual(saved['engine'], '')
+            self.assertEqual(saved['license'], '')
+            g.save_config(path, {'engine': '/opt/unmicro'})
+            self.assertEqual(json.load(open(path))['engine'], '/opt/unmicro')
+        finally:
+            del sys._MEIPASS
 
     def test_bird_polygon(self):
         pts = g.bird_polygon(2.0, 1.0, 1.0)

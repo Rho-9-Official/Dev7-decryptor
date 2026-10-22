@@ -3,10 +3,10 @@
 
 Rho-9 Systems. Styled after Aviary (Hyper dark).
 
-Same tabs, wording and behaviour as the Tk UI (unmicro_gui.py), which is the
+Same tabs, wording and behaviour as the Tk UI (tk_ui.py), which is the
 reference. Everything that is not a widget (the command line, the output
 parser, process control, the estimates, the safety limits) comes from
-unmicro_core; this file only draws it. The GUI never decrypts anything
+core.py; this file only draws it. The GUI never decrypts anything
 itself: it runs the already built unmicro binary (or unmicro.py) with a
 terminal on its stdin, so unmicro's own pause menu and prompts work.
 """
@@ -17,8 +17,8 @@ import sys
 import threading
 import time
 
-from unmicro_core import *  # noqa: F401,F403  (shared with the Tk UI)
-from unmicro_core import helper_main
+from .core import *  # noqa: F401,F403  (shared with the Tk UI)
+from .core import helper_main
 
 
 class Var(object):

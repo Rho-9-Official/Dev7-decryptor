@@ -5,8 +5,8 @@ Rho-9 Systems. Styled after Aviary (Hyper dark).
 
 The GUI never decrypts anything itself. It builds an unmicro command line from
 the choices on its tabs, runs the already built binary (or unmicro.py), and
-reads its output. Pure standard library, shared by the Tk UI (unmicro_gui.py)
-and the PySide6 UI (unmicro_qt.py), on Windows, macOS and Linux.
+reads its output. Pure standard library, shared by the Tk UI (tk_ui.py)
+and the PySide6 UI (qt_ui.py), on Windows, macOS and Linux.
 
 The binary is driven the way a person at a terminal would drive it: its
 standard input is a terminal (a pty on Linux/macOS, a hidden console on
@@ -30,7 +30,7 @@ import threading
 import time
 
 APP_NAME = 'unmicro'
-APP_VERSION = '0.1.0'
+from . import __version__ as APP_VERSION  # noqa: E402
 WINDOWS = os.name == 'nt'
 MACOS = sys.platform == 'darwin'
 EXT = '.cryptedmicro'
@@ -138,11 +138,14 @@ def _console_send(pid, action, text=''):
 
 
 def _helper_cmd():
-    # the GUI entry point (frozen exe or unmicro_qt.py) dispatches helper modes
+    """How to start a copy of this program in a helper mode. Every entry
+    point (the built exe, python -m unmicro_app, either UI's main) hands the
+    helper modes to helper_main() before anything else."""
     if getattr(sys, 'frozen', False):
         return [sys.executable]
-    # whichever UI script started us handles the helper modes
-    return [sys.executable, os.path.abspath(sys.argv[0])]
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv.pop(1)); '
+            'from unmicro_app.core import helper_main; sys.exit(helper_main())', pkg_parent]
 
 
 # --------------------------------------------------------------------------
@@ -1103,7 +1106,9 @@ class Engine(object):
     @staticmethod
     def candidates():
         here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
-        dirs = [here, os.path.join(here, 'engine'), os.getcwd(), os.path.expanduser('~/tools'),
+        # a copy bundled inside the one-file exe comes first
+        bundled = [os.path.join(sys._MEIPASS, 'engine')] if hasattr(sys, '_MEIPASS') else []
+        dirs = bundled + [here, os.path.join(here, 'engine'), os.getcwd(), os.path.expanduser('~/tools'),
                 os.path.expanduser('~/Downloads'), os.path.expanduser('~/Desktop')]
         pats = (re.compile(r'^unmicro-[\d.]+-windows-x86_64\.exe$', re.I) if WINDOWS else re.compile(r'^unmicro-[\d.]+-linux-x86_64$'),
                 re.compile(r'^unmicro(\.exe)?$', re.I), re.compile(r'^unmicro\.py$'))
@@ -1326,6 +1331,11 @@ def save_config(path, cfg):
     data = dict(cfg)
     if not data.get('remember_license'):
         data['license'] = ''
+    # an engine bundled in the one-file exe lives in a temporary folder that
+    # changes every start: found again each time, never saved
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass and os.path.abspath(data.get('engine') or '').startswith(os.path.abspath(meipass) + os.sep):
+        data['engine'] = ''
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp'

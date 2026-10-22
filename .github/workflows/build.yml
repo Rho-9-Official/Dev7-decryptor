@@ -1,0 +1,121 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      engine_url:
+        description: 'Optional: URL of the unmicro engine (unmicro-<version>-windows-x86_64.exe) to bundle inside the exe'
+        required: false
+        default: ''
+      engine_sha256:
+        description: 'SHA-256 of that file (required with engine_url)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - name: Install build tools
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Engine to bundle (optional)
+        shell: pwsh
+        env:
+          ENGINE_URL: ${{ inputs.engine_url }}
+          ENGINE_SHA256: ${{ inputs.engine_sha256 }}
+        run: |
+          $dir = Join-Path $PWD 'engine'
+          if ($env:ENGINE_URL) {
+            if (-not $env:ENGINE_SHA256) { throw 'engine_sha256 is required with engine_url' }
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            $name = [IO.Path]::GetFileName(([uri]$env:ENGINE_URL).AbsolutePath)
+            Invoke-WebRequest -Uri $env:ENGINE_URL -OutFile (Join-Path $dir $name)
+            $got = (Get-FileHash (Join-Path $dir $name) -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $env:ENGINE_SHA256.Trim().ToLower()) { throw "engine checksum mismatch: $got" }
+          }
+          if (Test-Path (Join-Path $dir '*.exe')) {
+            "UNMICRO_ENGINE_DIR=$dir" >> $env:GITHUB_ENV
+            Get-ChildItem $dir | ForEach-Object { "bundling $($_.Name) $((Get-FileHash $_.FullName -Algorithm SHA256).Hash)" }
+          } else {
+            'no engine bundled: the exe looks for unmicro next to itself, or the user picks it on Settings'
+          }
+
+      - name: Icon and version info
+        run: python packaging/make_assets.py
+
+      - name: Build the one-file exe
+        run: pyinstaller --noconfirm --clean packaging/unmicro.spec
+
+      - name: Smoke test (both windows open and close, console helper works)
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path dist\unmicro-gui.exe
+          $env:UNMICRO_GUI_TEST_HOOK = Resolve-Path packaging\smoke_hook.py
+          foreach ($ui in 'qt', 'tk') {
+            $env:SMOKE_OUT = Join-Path $PWD "smoke-$ui.txt"
+            $p = Start-Process $exe -ArgumentList "--$ui" -PassThru
+            if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "$ui window did not close" }
+            if (-not (Test-Path $env:SMOKE_OUT)) { throw "$ui window did not start" }
+            Get-Content $env:SMOKE_OUT
+          }
+          # the hidden-console helper the GUI uses to give unmicro a terminal
+          $p = Start-Process $exe -ArgumentList '--console-host', 'cmd.exe', '/c', 'echo console-helper-ok' -RedirectStandardOutput helper.txt -PassThru -Wait
+          $out = Get-Content helper.txt -Raw
+          if ($out -notmatch 'console-helper-ok') { throw "console helper failed: $out" }
+          'console helper ok'
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\unmicro-gui.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  unmicro-gui.exe" | Out-File -Encoding ascii dist\unmicro-gui.exe.sha256
+          "sha256 $h"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unmicro-gui-windows
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unmicro-gui-windows
+          path: dist
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "unmicro GUI $TAG" --notes "Windows one-file build. Check unmicro-gui.exe against unmicro-gui.exe.sha256."
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
