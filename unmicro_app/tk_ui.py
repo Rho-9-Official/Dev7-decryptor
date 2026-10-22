@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""unmicro GUI: a desktop front end for the unmicro decryptor binary.
+"""unmicro GUI (Tk): the classic window of unmicro.
 
 Rho-9 Systems. Styled after Aviary (Hyper dark).
 
-The GUI never decrypts anything itself. It builds an unmicro command line from
-the choices on its tabs, runs the already built binary (or unmicro.py), and
-reads its output. Pure standard library (tkinter), so the same file runs on
-Windows, macOS and Linux. Everything that is not a widget lives in
-core.py, shared with the PySide6 UI (qt_ui.py).
-
-The binary is driven the way a person at a terminal would drive it: its
-standard input is a terminal (a pty on Linux/macOS, a hidden console on
-Windows). That matters because unmicro 3.9.1 only handles Ctrl+C cleanly when
-it is interactive: it opens its pause menu, and the GUI answers "2" (stop and
-recover the files already matched). Run non-interactively it hangs inside the
-worker pool instead. The same channel answers the "keep going into
-N-character keys?" question with a dialog.
+The window never decrypts anything itself: it builds an unmicro command line
+from the choices on its tabs, runs the engine, and reads its output. Pure
+standard library (tkinter), so the same file runs on Windows, macOS and
+Linux. Everything that is not a widget lives in core.py, shared with the
+PySide6 UI (qt_ui.py); core.py's docstring explains how the engine is run
+and stopped.
 """
 import os
 import queue

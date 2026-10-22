@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""unmicro GUI (PySide6): a desktop front end for the unmicro decryptor binary.
+"""unmicro GUI (PySide6): the modern window of unmicro.
 
 Rho-9 Systems. Styled after Aviary (Hyper dark).
 
 Same tabs, wording and behaviour as the Tk UI (tk_ui.py), which is the
 reference. Everything that is not a widget (the command line, the output
 parser, process control, the estimates, the safety limits) comes from
-core.py; this file only draws it. The GUI never decrypts anything
-itself: it runs the already built unmicro binary (or unmicro.py) with a
-terminal on its stdin, so unmicro's own pause menu and prompts work.
+core.py; this file only draws it. The window never decrypts anything
+itself: it runs the engine (built in, or one chosen on Settings) with a
+terminal on its stdin, so the engine's prompts work; core.py's docstring
+explains how the engine is run and stopped.
 """
 import html
 import os

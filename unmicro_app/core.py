@@ -3,18 +3,22 @@
 
 Rho-9 Systems. Styled after Aviary (Hyper dark).
 
-The GUI never decrypts anything itself. It builds an unmicro command line from
-the choices on its tabs, runs the already built binary (or unmicro.py), and
-reads its output. Pure standard library, shared by the Tk UI (tk_ui.py)
-and the PySide6 UI (qt_ui.py), on Windows, macOS and Linux.
+The window never decrypts anything itself: it builds an unmicro command line
+from the choices on its tabs, runs the engine, and reads its output. Pure
+standard library, shared by the Tk UI (tk_ui.py) and the PySide6 UI
+(qt_ui.py), on Windows, macOS and Linux.
 
-The binary is driven the way a person at a terminal would drive it: its
-standard input is a terminal (a pty on Linux/macOS, a hidden console on
-Windows). That matters because unmicro 3.9.1 only handles Ctrl+C cleanly when
-it is interactive: it opens its pause menu, and the GUI answers "2" (stop and
-recover the files already matched). Run non-interactively it hangs inside the
-worker pool instead. The same channel answers the "keep going into
-N-character keys?" question with a dialog.
+How the engine runs: unmicro.py is built into this program, and the window
+runs a second copy of the program with --engine and the command line built
+from its tabs (an external unmicro binary or unmicro.py can be chosen on
+Settings instead). The engine's standard input is a terminal (a pty on Linux
+and macOS, a hidden console on Windows) so its prompts work: the window
+answers the "keep going into N-character keys?" question from a dialog, and
+"Press Enter to close" on its own. Stop asks the built-in engine to stop
+through a stop file; it then stops at the end of the current batch and
+recovers every file already matched, as its pause menu's option 2 would. An
+external engine is sent Ctrl+C instead, and the window answers its pause
+menu with 2.
 """
 import codecs
 import json
@@ -164,9 +168,11 @@ def run_engine(args, hold_allowed=True):
 
 def win_route_ctrl_c():
     """Windows only. Make Ctrl+C on this process's console reach Python's
-    SIGINT handling (the engine's pause menu). A windowed program that gets
-    its console after Python started never has Ctrl+C routed to Python, so
-    Windows' default action ends the process instead."""
+    SIGINT handling (the engine's pause menu) for a person pressing it in the
+    console --cli opens. A windowed program that gets its console after
+    Python started never has Ctrl+C routed to Python, so Windows' default
+    action would end the process instead. (The window itself stops the
+    built-in engine through a stop file, not Ctrl+C.)"""
     import ctypes
     import signal
     import _thread
@@ -247,9 +253,10 @@ def _console_host(argv):
             ctypes.windll.user32.ShowWindow(hwnd, 0)
         k32.SetStdHandle(-11, wintypes.HANDLE(hout))
         k32.SetStdHandle(-12, wintypes.HANDLE(herr))
-    # The GUI sends Ctrl+C and keystrokes by attaching to a process on this
-    # console. In the one-file exe the process it started is PyInstaller's
-    # launcher, which is not on the console, so say which one is.
+    # The window types answers to the engine's prompts (and sends an external
+    # engine Ctrl+C) by attaching to a process on this console. In the
+    # one-file exe the process it started is PyInstaller's launcher, which is
+    # not on the console, so say which one is.
     pidfile = os.environ.pop(PIDFILE_ENV, None)
     if pidfile:
         try:
