@@ -12,12 +12,12 @@ the ones renamed to `.cryptedmicro`.
 
 > **Warning: 5.0 is experimental and may contain bugs.** It is the first
 > release as one program (the window with the engine built in).
-> **Linux (x86_64) is the platform known to be stable:** its build was tested
-> end to end, including recovery, stop-and-recover and the safety limits.
-> **Windows** is built and smoke-tested automatically, but has not yet been
-> tested on a real Windows machine. Whatever happens, your encrypted files
-> are only ever read, never changed. If something goes wrong, email
-> recon@rho-9.com with what you saw.
+> **Linux (x86_64) and Windows 10 (64-bit) were both tested end to end**,
+> including recovery, stop-and-recover and the safety limits. Other systems
+> (Windows 11, other Linux distributions) are expected to work but have not
+> been tested. Whatever happens, your encrypted files are only ever read,
+> never changed. If something goes wrong, email recon@rho-9.com with what you
+> saw.
 
 Built and maintained by **Rho-9 Systems**. Your first line of unusual defense.
 
@@ -610,6 +610,10 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Windows fixes (5.0.1).** On Windows, "Stop and recover what is matched"
+  (and the safety limits) ended the search without recovering anything; it
+  now pauses and recovers every matched file, as on Linux. The progress file
+  no longer sticks to an earlier output folder.
 - **One program with a window (5.0).** unmicro is now a single
   download per platform: a window that walks through files, keys, search,
   output and the run, with the engine built in. The command line is inside the

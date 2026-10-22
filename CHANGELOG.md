@@ -2,7 +2,31 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
-## 5.0
+## 5.0.1
+
+Windows fixes, found testing 5.0 on a real Windows 10 machine.
+
+### Fixed
+- **Stop now recovers on Windows.** "Stop and recover what is matched", and a
+  safety limit stopping an endless run, ended the engine at once on Windows,
+  so nothing was recovered and its worker processes were left running. Ctrl+C
+  now reaches the engine's pause menu there too, and every file already
+  matched to a key is recovered. The same applied to Ctrl+C in the console
+  `--cli` opens.
+- **No stray "Press Enter to close"** when the window runs the engine on
+  Windows.
+- **The engine's output reaches the window as it is printed**, instead of in
+  bursts.
+- **The progress file follows the output folder.** It used to be saved as a
+  fixed path, so it stuck to an earlier output folder.
+- **Tests** pass on Windows (one expected the Linux form of the copied
+  command).
+
+### Changed
+- The README: getting, running and stopping the one program, its settings
+  and safety limits, `--cli`, and building and releasing. Linux and
+  Windows 10 are both named as tested.
+
 
 One program per platform: a window with the engine built in.
 

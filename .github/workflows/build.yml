@@ -297,10 +297,10 @@ jobs:
           renamed to `.cryptedmicro`.
 
           > **Warning: this release is experimental and may contain bugs.**
-          > **Linux (x86_64) is the platform known to be stable** (tested end
-          > to end). The Windows build is smoke-tested here but has not yet
-          > been tested on a real Windows machine. Your encrypted files are
-          > only ever read, never changed. Report problems to recon@rho-9.com.
+          > Linux (x86_64) and Windows 10 (64-bit) were both tested end to end;
+          > other systems are expected to work but have not been tested. Your
+          > encrypted files are only ever read, never changed. Report problems
+          > to recon@rho-9.com.
 
           Actor: **Chattering Magpies** (R9-C001). Malware self-name: Micro.
           Family: Dev7.
