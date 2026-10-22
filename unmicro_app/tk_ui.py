@@ -953,7 +953,7 @@ def run_gui():
     gr = tk.Frame(c, bg=C['card'])
     gr.pack(fill='x', pady=(0, 10))
     Toggle(gr, V['gpu'], 'Use the graphics card (OpenCL)',
-           'NVIDIA or AMD with OpenCL drivers. unmicro checks the GPU against the CPU first and falls back if it disagrees. Not used for the newer (GCM) files.',
+           'NVIDIA or AMD with OpenCL drivers. unmicro checks the GPU against the CPU first and falls back if it disagrees. Speeds up both the older and the newer (GCM) files.',
            command=lambda: (dumb_changed(), refresh_review())).pack(side='left', fill='x', expand=True)
     Btn(gr, 'Check GPU', lambda: quick_run(['--gpu-info'], 'GPU check', need_license=False), 'ghost', small=True).pack(side='right', padx=(16, 0))
     g2 = tk.Frame(c, bg=C['card'])

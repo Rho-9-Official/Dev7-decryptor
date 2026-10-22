@@ -2,6 +2,52 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 5.1.0
+
+### Added
+- **`--gpu` now speeds up the GCM files.** The newer `.cryptedmicro` files
+  cost a 600,000-round PBKDF2-HMAC-SHA256 per guess, and that key stretch now
+  runs on the GPU: an OpenCL kernel derives the keys for a whole batch of
+  guesses (or of found keys and files) at once, splitting the rounds over
+  short launches so no display watchdog is tripped. Passwords over 64 bytes
+  are pre-hashed as HMAC requires. Used in the GCM search and when a found
+  key is mapped across the files. Measured on an RTX 3060: about 1,300 key
+  derivations a second, against about 9 a second per CPU core. End to end,
+  20,000 wordlist guesses on 34 files with 11-20 MB probes took 178 seconds
+  with `--gpu` and 997 on the 12 CPU threads alone, the same 33 files
+  recovered byte for byte; there the CPU's tag checks on the large probes, not
+  the GPU, set the pace.
+- **Pause and Stop stay prompt with `--gpu`.** A GPU chunk is a full batch of
+  guesses, and its tag checks go out in small waves. A pause or Stop between
+  waves ends the chunk there, and every guess of it that has not been fully
+  checked is tried again first, so pausing never skips a guess.
+- **It cannot give a wrong result.** Before use, the kernel's output is
+  compared byte for byte with `hashlib.pbkdf2_hmac`: passwords from 0 to 1,000
+  bytes (either side of the 64-byte HMAC block), non-ASCII keys, random
+  salts, round counts split unevenly across launches, and the full 600,000
+  rounds. Any mismatch turns the GPU off for the GCM files and the CPU does
+  them, as with the AES self-test for the older files. The CPU still checks
+  every derived key against the file's full GCM tag, across all cores, and a
+  GPU error mid-run hands the rest back to the CPU.
+- `UNMICRO_OPENCL_DEVICE` picks an OpenCL device by part of its name, of any
+  type. `--gpu` otherwise takes only GPUs; this is how an OpenCL CPU runtime
+  such as pocl is used for testing.
+- `tests/test_gpu_gcm.py`: the kernel against hashlib, the search and
+  mapping with the GPU against the CPU result, and stand-ins for a broken and a
+  failing GPU. The device tests are skipped without pyopencl and a device.
+
+### Changed
+- The GPU self-test for the older files and the one for the GCM files are
+  separate, so one failing does not turn off the other.
+
+### Fixed
+- The 5.0.1 and 5.0 headings were missing from this changelog.
+
+### Tested
+- On an NVIDIA RTX 3060 (CUDA OpenCL) and on pocl 6 (CPU): the kernel
+  self-test, and the full test suite with `UNMICRO_OPENCL_DEVICE` set to
+  each.
+
 ## 5.0.2
 
 ### Changed
@@ -19,6 +65,7 @@ All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
   installed: Windows 10 (64-bit) and a plain Ubuntu 24.04 with only a
   desktop's libraries.
 
+## 5.0.1
 
 Windows fixes, found testing 5.0 on a real Windows 10 machine.
 
@@ -43,6 +90,7 @@ Windows fixes, found testing 5.0 on a real Windows 10 machine.
   and safety limits, `--cli`, and building and releasing. Linux and
   Windows 10 are both named as tested.
 
+## 5.0
 
 One program per platform: a window with the engine built in.
 

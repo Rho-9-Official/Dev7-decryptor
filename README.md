@@ -548,7 +548,9 @@ What changes is the cost of a guess: 600,000 PBKDF2 rounds per file, roughly
 tries the supplied keys, wordlist, recovered operator keys, scavenged strings
 and (under `--brute`) the recovered key variants, and leaves the fitted model
 and the structural brute to the older files, where they finish in a sensible
-time. The GPU path is not used for GCM.
+time. With `--gpu` the key stretch for those guesses runs on the GPU (see
+[GPU acceleration](#gpu-acceleration-optional-experimental)), which is
+over a hundred times faster per card than per CPU core.
 
 Because a GCM guess is so expensive, each one is checked against two files at
 a time, and a key that opens one of them is then tried on every other file.
@@ -611,6 +613,9 @@ These are real and are not regressions:
 
 ## What's new
 
+- **`--gpu` for the GCM files (5.1).** The 600,000-round key stretch behind
+  every guess on the newer files now runs on the GPU, checked against the
+  CPU before use. See [GPU acceleration](#gpu-acceleration-optional-experimental).
 - **Stop without Ctrl+C (5.0.2).** The window's Stop, and the safety limits,
   now ask the engine to stop directly instead of sending it Ctrl+C, the same
   on every platform. Both downloads were tested on machines with no Python
@@ -706,6 +711,40 @@ python3 unmicro.py --in ./encrypted --out ./rec --dumb-brute --gpu
 The fitted-model tier stays on the CPU (its candidates come from Python logic
 that does not map to a GPU); the big win is the structural brute.
 
+### The newer (GCM) files
+
+On the GCM files a guess is not one AES block but a 600,000-round
+PBKDF2-HMAC-SHA256 with the file's own salt, then one tag check. Since 5.1,
+`--gpu` puts the PBKDF2 on the GPU: an OpenCL kernel derives the keys for a
+batch of guesses at once (thousands on a desktop card), the rounds split over
+short launches so a display driver's watchdog is never tripped. The same
+kernel derives the keys when a found key is tried across every file. On an
+RTX 3060 that is about 1,300 guesses a second; a CPU core does about 9.
+
+The GPU only derives keys. The CPU still checks every derived key against the
+file's full 128-bit GCM tag, across all cores, exactly as it does for its own,
+so a wrong key from the GPU can only fail to open a file, never open it
+wrongly. The probe files are large (10 MB or more where there are any), so on
+a fast card those tag checks, not the GPU, can set the pace: 20,000 guesses
+against 11-20 MB probes took 178 seconds with an RTX 3060 and 997 on 12 CPU
+threads alone. A pause or Stop is answered between waves of tag checks, and
+the guesses not yet fully checked are tried again first, so none is skipped. Before the GPU is
+used for a single GCM guess, its output must equal `hashlib.pbkdf2_hmac` byte
+for byte, over passwords either side of the 64-byte HMAC block (longer ones
+are pre-hashed, as HMAC requires), non-ASCII keys, random salts, uneven
+splits of the rounds, and the full 600,000 rounds. On any mismatch, or an
+OpenCL error during the run, the GCM files go to the CPU. Look for
+`GPU ready for the GCM files: …`.
+
+`--gpu` takes GPUs only. To run on another OpenCL device, such as the pocl CPU
+runtime used to test this, set `UNMICRO_OPENCL_DEVICE` to part of its name
+(`--gpu-info` lists them):
+
+```
+pip install pyopencl numpy pocl-binary-distribution
+UNMICRO_OPENCL_DEVICE=portable python3 -m unittest tests.test_gpu_gcm -v
+```
+
 It is opt-in, and safe by construction for a recovery tool. Key derivation stays
 on the CPU, so nothing is mis-encoded on the device. Two self-tests run before
 the GPU is trusted for a single real candidate: it decrypts random blocks under
@@ -755,7 +794,7 @@ The engine's options, after `--cli` (or after `python3 unmicro.py`):
 | `--checkpoint FILE` | save sweep progress and resume from it, so an interrupted or capped run continues |
 | `--seen-cap N` | cap each generator's dedup set at N entries (default 1,000,000). Lower on a low-memory machine |
 | `--workers N` | parallel worker processes for the sweep. Defaults to every CPU core; set 1 to stay single-process |
-| `--gpu` | use an OpenCL GPU (NVIDIA or AMD) for the sweep. Self-tests against the CPU first and falls back if it fails |
+| `--gpu` | use an OpenCL GPU (NVIDIA or AMD) for the sweep: AES for the older files, the key stretch for the GCM files. Self-tests against the CPU first and falls back if it fails |
 | `--gpu-info` | list the OpenCL platforms and devices found, and exit |
 | `--max-candidates N` | give up after N guesses |
 | `--yes` | answer yes to prompts, for unattended runs |

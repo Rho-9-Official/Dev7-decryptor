@@ -25,7 +25,7 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '5.0.2'
+VERSION = '5.1.0'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
 # Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the
@@ -51,6 +51,10 @@ GCM_PROBES = 2
 GCM_ROTATE_FILES = 16
 GCM_ROTATE_TIERS = ('supplied keys', 'recovered operator keys')
 GCM_PROBE_CACHE_CAP = 4
+# With --gpu, a GCM chunk is a full GPU batch, and the CPU's tag checks on
+# it go out this many per worker at a time, so a pause or Stop is answered
+# within one wave even on large probes.
+GCM_GPU_VERIFY_WAVE = 4
 # Probe choice. Probes are the files every key guess is tested against. They
 # are taken from files of at least PROBE_MIN_BYTES where there are enough,
 # spread across sizes and across folders: never two from one folder unless
@@ -2630,42 +2634,102 @@ def _gcm_worker_init():
     if BACKEND is None:
         _init_backend(False)
 
+def _gcm_probe_opens(path, dk):
+    """True when derived key dk passes the probe file's full GCM tag."""
+    salt, iv, body, tag = _gcm_probe(path)
+    if body is None:
+        psize = file_size(path)
+        if psize is None:
+            return False
+        return gcm_stream(path, psize, iv, tag, dk, keep=False)[1] is None
+    ctx = _gcm_new(dk, iv, tag)
+    ctx.update(body)
+    return ctx.verify()
+
 def _gcm_worker_chunk(job):
     chunk, probe_paths = job
     hits = []
     for cand in chunk:
         for path in probe_paths:
             try:
-                salt, iv, body, tag = _gcm_probe(path)
+                salt = _gcm_probe(path)[0]
+                dk = gcm_kdf(cand, salt)
+                opened = _gcm_probe_opens(path, dk)
             except (OSError, ValueError):
                 continue
-            dk = gcm_kdf(cand, salt)
-            if body is None:
-                psize = file_size(path)
-                if psize is None:
-                    continue
-                opened = gcm_stream(path, psize, iv, tag, dk, keep=False)[1] is None
-            else:
-                ctx = _gcm_new(dk, iv, tag)
-                ctx.update(body)
-                opened = ctx.verify()
             if opened:
                 hits.append((cand, path, salt, dk))
                 break
     return hits
 
+def _gcm_verify_chunk(job):
+    """The CPU half of a GPU chunk: each (guess, derived key) pair against
+    one probe's full tag."""
+    path, salt, pairs = job
+    hits = []
+    for cand, dk in pairs:
+        try:
+            if _gcm_probe_opens(path, dk):
+                hits.append((cand, path, salt, dk))
+        except (OSError, ValueError):
+            break
+    return hits
+
+def _gcm_gpu_chunk(gpu, chunk, probe_paths, pool, workers, should_stop=None):
+    """sweep_gcm's chunk with the PBKDF2 on the GPU. Same result as
+    _gcm_worker_chunk: a guess that opens a probe is not tried on the next.
+    Every derived key is still checked against the full tag on the CPU,
+    across the pool, in waves. Returns (hits, carry): when should_stop()
+    turns true between waves, the checks end there and carry holds every
+    guess of the chunk that has not opened a probe, to be tried again in
+    full, so a pause loses nothing."""
+    hits = []
+    left = list(chunk)
+    wave = max(1, workers) * GCM_GPU_VERIFY_WAVE
+    for path in probe_paths:
+        if not left:
+            break
+        try:
+            salt = gcm_header(path)[1]
+        except (OSError, ValueError):
+            continue
+        pairs = list(zip(left, gpu.derive_keys(left, salt)))
+        opened = set()
+        for w in range(0, len(pairs), wave):
+            if should_stop is not None and should_stop():
+                opened.update((h[0] for h in hits))
+                return (hits, [c for c in chunk if c not in opened])
+            batch = pairs[w:w + wave]
+            if pool:
+                parts = pool.map(_gcm_verify_chunk, [(path, salt, batch[i::workers]) for i in range(workers)])
+            else:
+                parts = [_gcm_verify_chunk((path, salt, batch))]
+            for part in parts:
+                hits.extend(part)
+                opened.update((h[0] for h in part))
+        left = [c for c in left if c not in opened]
+    return (hits, [])
+
 def _gcm_map_worker(job):
-    path, keys = job
+    """job is (path, keys) or (path, keys, derived keys): with derived keys
+    (from the GPU) no PBKDF2 is run here, only the tag checks."""
+    path, keys = job[:2]
+    dks = job[2] if len(job) > 2 else None
     try:
         size, salt, iv, tag = gcm_header(path)
     except (OSError, ValueError):
         return (path, None, None, None)
-    for k in keys:
-        dk = gcm_kdf(k, salt)
+    for i, k in enumerate(keys):
+        dk = dks[i] if dks is not None else gcm_kdf(k, salt)
         pt, _ = gcm_stream(path, size, iv, tag, dk, keep=False)
         if pt is not None:
             return (path, k, salt, dk)
     return (path, None, None, None)
+
+def _gpu_gcm_failed(e, quiet):
+    if not quiet:
+        STATUS.live_done()
+        print('The GPU stopped working on the GCM files (%s). Using the CPU for them.' % e)
 
 def _make_pool(workers, initializer=None, initargs=()):
     if workers <= 1:
@@ -2683,9 +2747,10 @@ def _fmt_duration(secs):
         return '%.0f minutes' % (secs / 60.0)
     return '%.1f hours' % (secs / 3600.0)
 
-def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
+def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None, gpu=None):
     """Returns (found keys, guesses tried). probed, when given, is a set
-    that collects every file a guess was actually checked against."""
+    that collects every file a guess was actually checked against. gpu, a
+    GpuPBKDF2 that has passed its self-test, takes over the PBKDF2."""
     order = gcm_probe_order(files)
     if not order:
         return ([], 0)
@@ -2697,7 +2762,10 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
     first_seen = BoundedSeen()
     tried = 0
     t0 = time.time()
-    chunk_size = max(1, workers) * 4
+    chunk_size = cpu_chunk = max(1, workers) * 4
+    if gpu is not None:
+        chunk_size = max(chunk_size, gpu.batch)
+    carry = []
     try:
         for name, factory in tiers:
             tier_start = tried
@@ -2726,8 +2794,9 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
                         STATUS.say('  Press Ctrl+C at any time to pause.')
                     gen = iter(gen)
                 while True:
-                    chunk = []
-                    for cand in gen:
+                    # Guesses a pause cut short come first, already in seen.
+                    chunk, carry = (carry[:chunk_size], carry[chunk_size:])
+                    for cand in gen if len(chunk) < chunk_size else ():
                         if not cand or cand in seen:
                             continue
                         seen.add(cand)
@@ -2739,13 +2808,23 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
                     if not chunk:
                         break
                     probed.update(probes)
-                    if pool:
+                    hits = None
+                    cut = []
+                    if gpu is not None:
+                        try:
+                            hits, cut = _gcm_gpu_chunk(gpu, chunk, probes, pool, workers, should_stop=lambda: STATUS.pause_requested)
+                        except Exception as e:
+                            _gpu_gcm_failed(e, quiet)
+                            gpu = None
+                            chunk_size = cpu_chunk
+                    if hits is None and pool:
                         hits = []
                         for part in pool.map(_gcm_worker_chunk, [(chunk[i::workers], probes) for i in range(workers)]):
                             hits.extend(part)
-                    else:
+                    elif hits is None:
                         hits = _gcm_worker_chunk((chunk, probes))
-                    tried += len(chunk)
+                    tried += len(chunk) - len(cut)
+                    carry = cut + carry
                     for cand, _path, salt, dk in hits:
                         _kdf_remember(cand, salt, dk)
                         if cand not in found:
@@ -2773,10 +2852,29 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None):
             pool.join()
     return ([], tried)
 
-def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
+def _gcm_gpu_map_jobs(gpu, jobs):
+    """Map jobs with their derived keys filled in by the GPU, one batch of
+    (file, key) pairs per launch. A file whose header cannot be read keeps
+    the plain job and is reported by the worker as before."""
+    salts = {}
+    for path, _keys in jobs:
+        try:
+            salts[path] = gcm_header(path)[1]
+        except (OSError, ValueError):
+            pass
+    pairs = [(path, k) for path, ks in jobs if path in salts for k in ks]
+    dks = {}
+    for i in range(0, len(pairs), gpu.batch):
+        part = pairs[i:i + gpu.batch]
+        for (path, k), dk in zip(part, gpu.derive_keys([k for _, k in part], [salts[p] for p, _ in part])):
+            dks[path, k] = dk
+    return [(path, ks, [dks[path, k] for k in ks]) if path in salts else (path, ks) for path, ks in jobs]
+
+def map_gcm_keys_to_files(files, keys, workers=1, quiet=False, gpu=None):
     """Try each found key on each GCM-shaped file, verifying the full tag.
-    One PBKDF2 per key per file, so this runs across the worker pool, and
-    the derived keys come back to be reused when the files are written."""
+    One PBKDF2 per key per file, so this runs across the worker pool (or,
+    with gpu, on the GPU, leaving only the tag checks to the pool), and the
+    derived keys come back to be reused when the files are written."""
     jobs = [(p, list(keys)) for p in files if gcm_shaped(file_size(p))]
     mapping = {}
     if not jobs:
@@ -2784,15 +2882,30 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
     pool = _make_pool(min(workers, len(jobs)), _ignore_sigint)
     done = 0
     t0 = time.time()
+    # With the GPU the files go in slices, each slice's keys derived in one
+    # go, so the progress line still moves on a large set of files.
+    slices = [jobs]
+    if gpu is not None:
+        per = max(1, gpu.batch // max(1, len(keys)))
+        slices = [jobs[i:i + per] for i in range(0, len(jobs), per)]
     try:
-        results = pool.imap_unordered(_gcm_map_worker, jobs) if pool else map(_gcm_map_worker, jobs)
-        for path, k, salt, dk in results:
-            done += 1
-            if k is not None:
-                _kdf_remember(k, salt, dk)
-                mapping.setdefault(k, []).append(path)
-            if not quiet and (done % 8 == 0 or done == len(jobs)):
-                STATUS.live('Checking files against the key found: %s of %s done, %s elapsed' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
+        for part in slices:
+            if gpu is not None:
+                if not quiet:
+                    STATUS.live('Checking files against the key found: %s of %s done, %s elapsed (deriving keys on the GPU)' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
+                try:
+                    part = _gcm_gpu_map_jobs(gpu, part)
+                except Exception as e:
+                    _gpu_gcm_failed(e, quiet)
+                    gpu = None
+            results = pool.imap_unordered(_gcm_map_worker, part) if pool else map(_gcm_map_worker, part)
+            for path, k, salt, dk in results:
+                done += 1
+                if k is not None:
+                    _kdf_remember(k, salt, dk)
+                    mapping.setdefault(k, []).append(path)
+                if not quiet and (done % 8 == 0 or done == len(jobs)):
+                    STATUS.live('Checking files against the key found: %s of %s done, %s elapsed' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
     finally:
         if pool:
             pool.terminate()
@@ -2804,7 +2917,7 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
         mapping[k].sort(key=lambda p: order.get(p, 0))
     return mapping
 
-def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, on_part=None, probed=None, later_plan=None):
+def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, on_part=None, probed=None, later_plan=None, gpu=None):
     """on_part(mapping_part) is called as soon as each found key has been
     mapped, so a caller interrupted later still has every file matched so
     far. later_plan, when given, replaces plan once a key has opened
@@ -2834,12 +2947,12 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
             else:
                 print('  %d file(s) are not opened by the key found so far. Looking for another key' % len(remaining))
                 print('  for them (some may have been locked with a different key):')
-        found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed)
+        found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed, gpu=gpu)
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
         if not fresh:
             break
-        part = map_gcm_keys_to_files(remaining, fresh, workers=workers, quiet=quiet)
+        part = map_gcm_keys_to_files(remaining, fresh, workers=workers, quiet=quiet, gpu=gpu)
         if on_part is not None and part:
             on_part(part)
         covered = set()
@@ -2876,12 +2989,7 @@ class GpuAES(object):
         import pyopencl as cl
         import numpy as np
         self.cl, self.np = (cl, np)
-        devices = []
-        for plat in cl.get_platforms():
-            try:
-                devices += plat.get_devices(device_type=cl.device_type.GPU)
-            except cl.Error:
-                pass
+        devices = _opencl_devices(cl)
         if not devices:
             raise RuntimeError('no OpenCL GPU device found (NVIDIA or AMD drivers and an ICD must be installed)')
         self.device = devices[0]
@@ -3035,6 +3143,313 @@ def init_gpu(quiet=False):
         print('GPU ready: %s (AES self-test passed against the CPU back end).' % gpu.name)
     return gpu
 
+# ----------------------------------------------------------------------
+# GPU key derivation for the GCM files
+# ----------------------------------------------------------------------
+#
+# A GCM guess is a 600,000-round PBKDF2-HMAC-SHA256 and then one tag check,
+# so the PBKDF2 is what the GPU takes over. Each work item derives one
+# (password, salt) pair. The HMAC key block (the password, or its SHA-256
+# when it is over 64 bytes) is hashed once into inner and outer states, U1 is
+# computed in full, and every later round is then two single-block SHA-256
+# compressions. The rounds are split over many short launches, so no single
+# launch runs long enough to trip a display driver's watchdog. The derived
+# keys come back to the CPU, which checks each one against the file's full
+# GCM tag exactly as it does for its own, so the GPU only ever replaces
+# hashlib.pbkdf2_hmac, and is checked against it before it is used.
+_GPU_PBKDF2_KERNEL = r'''
+__constant uint K256[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+
+#define ROTR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+/* One SHA-256 compression of the 16 big-endian words w into st. */
+void sha256_block(uint* st, const uint* win){
+    uint w[64];
+    for(int i=0;i<16;i++) w[i] = win[i];
+    for(int i=16;i<64;i++){
+        uint s0 = ROTR(w[i-15],7) ^ ROTR(w[i-15],18) ^ (w[i-15] >> 3);
+        uint s1 = ROTR(w[i-2],17) ^ ROTR(w[i-2],19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint a=st[0],b=st[1],c=st[2],d=st[3],e=st[4],f=st[5],g=st[6],h=st[7];
+    for(int i=0;i<64;i++){
+        uint t1 = h + (ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i];
+        uint t2 = (ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    st[0]+=a; st[1]+=b; st[2]+=c; st[3]+=d; st[4]+=e; st[5]+=f; st[6]+=g; st[7]+=h;
+}
+
+/* Byte-at-a-time SHA-256, used only for the per-item setup (the long
+   password pre-hash, the key pads and U1), never inside the round loop. */
+typedef struct { uint h[8]; uint w[16]; uint n; ulong total; } sha_ctx;
+
+void sha_init(sha_ctx* c){
+    c->h[0]=0x6a09e667; c->h[1]=0xbb67ae85; c->h[2]=0x3c6ef372; c->h[3]=0xa54ff53a;
+    c->h[4]=0x510e527f; c->h[5]=0x9b05688c; c->h[6]=0x1f83d9ab; c->h[7]=0x5be0cd19;
+    c->n = 0; c->total = 0;
+}
+
+void sha_resume(sha_ctx* c, const uint* st, ulong done){
+    for(int i=0;i<8;i++) c->h[i] = st[i];
+    c->n = 0; c->total = done;
+}
+
+void sha_byte(sha_ctx* c, uchar b){
+    uint i = c->n;
+    if((i & 3) == 0) c->w[i >> 2] = 0;
+    c->w[i >> 2] |= ((uint)b) << (24 - 8 * (i & 3));
+    c->n = i + 1;
+    c->total++;
+    if(c->n == 64){ sha256_block(c->h, c->w); c->n = 0; }
+}
+
+void sha_final(sha_ctx* c, uint* out){
+    ulong bits = c->total * 8;
+    sha_byte(c, 0x80);
+    while(c->n != 56) sha_byte(c, 0);
+    for(int i=7;i>=0;i--) sha_byte(c, (uchar)(bits >> (8 * i)));
+    for(int i=0;i<8;i++) out[i] = c->h[i];
+}
+
+/* Per item: state[32*gid + 0..7] inner pad state, 8..15 outer pad state,
+   16..23 the last U, 24..31 the running XOR T. This sets all four for
+   round 1. */
+__kernel void pbkdf2_sha256_init(__global const uchar* pw, __global const uint* pw_off, __global const uint* pw_len,
+                                 __global const uchar* salt, __global const uint* salt_off, __global const uint* salt_len,
+                                 __global uint* state, const uint n){
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    uint po = pw_off[gid], pl = pw_len[gid];
+    uchar key[64];
+    for(int i=0;i<64;i++) key[i] = 0;
+    sha_ctx c;
+    if(pl > 64){
+        uint d[8];
+        sha_init(&c);
+        for(uint i=0;i<pl;i++) sha_byte(&c, pw[po + i]);
+        sha_final(&c, d);
+        for(int i=0;i<32;i++) key[i] = (uchar)(d[i >> 2] >> (24 - 8 * (i & 3)));
+    } else {
+        for(uint i=0;i<pl;i++) key[i] = pw[po + i];
+    }
+    uint ist[8], ost[8];
+    sha_init(&c);
+    for(int i=0;i<64;i++) sha_byte(&c, key[i] ^ 0x36);
+    for(int i=0;i<8;i++) ist[i] = c.h[i];
+    sha_init(&c);
+    for(int i=0;i<64;i++) sha_byte(&c, key[i] ^ 0x5c);
+    for(int i=0;i<8;i++) ost[i] = c.h[i];
+
+    uint inner[8], u[8];
+    sha_resume(&c, ist, 64);
+    uint so = salt_off[gid], sl = salt_len[gid];
+    for(uint i=0;i<sl;i++) sha_byte(&c, salt[so + i]);
+    sha_byte(&c, 0); sha_byte(&c, 0); sha_byte(&c, 0); sha_byte(&c, 1);
+    sha_final(&c, inner);
+    sha_resume(&c, ost, 64);
+    for(int i=0;i<32;i++) sha_byte(&c, (uchar)(inner[i >> 2] >> (24 - 8 * (i & 3))));
+    sha_final(&c, u);
+
+    __global uint* s = state + (ulong)gid * 32;
+    for(int i=0;i<8;i++){ s[i] = ist[i]; s[8+i] = ost[i]; s[16+i] = u[i]; s[24+i] = u[i]; }
+}
+
+/* Runs `rounds` further PBKDF2 rounds. Each one is HMAC over the 32-byte
+   previous U, which with the pads already hashed is one block for the inner
+   hash and one for the outer (64 + 32 bytes = 768 bits each). */
+__kernel void pbkdf2_sha256_rounds(__global uint* state, const uint n, const uint rounds){
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    __global uint* s = state + (ulong)gid * 32;
+    uint ist[8], ost[8], u[8], t[8], w[16], st[8];
+    for(int i=0;i<8;i++){ ist[i] = s[i]; ost[i] = s[8+i]; u[i] = s[16+i]; t[i] = s[24+i]; }
+    for(uint r=0;r<rounds;r++){
+        for(int i=0;i<8;i++) w[i] = u[i];
+        w[8] = 0x80000000;
+        for(int i=9;i<15;i++) w[i] = 0;
+        w[15] = 768;
+        for(int i=0;i<8;i++) st[i] = ist[i];
+        sha256_block(st, w);
+        for(int i=0;i<8;i++) w[i] = st[i];
+        for(int i=0;i<8;i++) st[i] = ost[i];
+        sha256_block(st, w);
+        for(int i=0;i<8;i++){ u[i] = st[i]; t[i] ^= st[i]; }
+    }
+    for(int i=0;i<8;i++){ s[16+i] = u[i]; s[24+i] = t[i]; }
+}
+'''
+
+# How long one rounds launch aims to take. Short enough to stay well clear
+# of a display watchdog (about 2 seconds on Windows), long enough that the
+# launch overhead does not count.
+GPU_KDF_LAUNCH_SECS = 0.25
+
+def _opencl_devices(cl):
+    """The OpenCL devices --gpu may use, best first: GPUs only, unless
+    UNMICRO_OPENCL_DEVICE names a device (any type, by part of its own or
+    its platform's name), which is also how an OpenCL CPU runtime such as
+    pocl is chosen for testing."""
+    want = os.environ.get('UNMICRO_OPENCL_DEVICE', '').strip().lower()
+    out = []
+    for plat in cl.get_platforms():
+        try:
+            devs = plat.get_devices() if want else plat.get_devices(device_type=cl.device_type.GPU)
+        except cl.Error:
+            continue
+        for d in devs:
+            if want and want not in d.name.lower() and want not in plat.name.lower():
+                continue
+            out.append(d)
+    return out
+
+class GpuPBKDF2(object):
+    """Batch PBKDF2-HMAC-SHA256 on an OpenCL device, for the GCM files."""
+
+    def __init__(self):
+        import pyopencl as cl
+        import numpy as np
+        self.cl, self.np = (cl, np)
+        devices = _opencl_devices(cl)
+        if not devices:
+            raise RuntimeError('no OpenCL GPU device found (NVIDIA or AMD drivers and an ICD must be installed)')
+        self.device = devices[0]
+        self.name = self.device.name.strip()
+        self.ctx = cl.Context([self.device])
+        self.queue = cl.CommandQueue(self.ctx)
+        self.prog = cl.Program(self.ctx, _GPU_PBKDF2_KERNEL).build()
+        units = max(1, int(self.device.max_compute_units))
+        if self.device.type & cl.device_type.GPU:
+            self.batch = units * 256
+        else:
+            self.batch = units * 4
+        self._rounds = 256
+
+    def derive(self, passwords, salts, iters=GCM_KDF_ITERS):
+        """32-byte PBKDF2-HMAC-SHA256 of each password (bytes) with the salt
+        at the same index; salts may also be a single salt for them all."""
+        if isinstance(salts, (bytes, bytearray)):
+            salts = [bytes(salts)] * len(passwords)
+        if len(salts) != len(passwords):
+            raise ValueError('one salt per password')
+        out = []
+        for i in range(0, len(passwords), self.batch):
+            out.extend(self._derive_batch(passwords[i:i + self.batch], salts[i:i + self.batch], iters))
+        return out
+
+    def derive_keys(self, key_strings, salts, iters=GCM_KDF_ITERS):
+        return self.derive([_gcm_password(k) for k in key_strings], salts, iters)
+
+    def _packed(self, items):
+        np = self.np
+        off, ln, buf = ([], [], [])
+        pos = 0
+        for b in items:
+            off.append(pos)
+            ln.append(len(b))
+            buf.append(bytes(b))
+            pos += len(b)
+        data = np.frombuffer(b''.join(buf) or b'\0', dtype=np.uint8).copy()
+        return (data, np.array(off, dtype=np.uint32), np.array(ln, dtype=np.uint32))
+
+    def _derive_batch(self, passwords, salts, iters):
+        cl, np = (self.cl, self.np)
+        n = len(passwords)
+        if n == 0:
+            return []
+        if iters < 1:
+            raise ValueError('iters must be at least 1')
+        mf = cl.mem_flags
+        RO = mf.READ_ONLY | mf.COPY_HOST_PTR
+        pw, pw_off, pw_len = self._packed(passwords)
+        sa, sa_off, sa_len = self._packed(salts)
+        bufs = [cl.Buffer(self.ctx, RO, hostbuf=a) for a in (pw, pw_off, pw_len, sa, sa_off, sa_len)]
+        state = cl.Buffer(self.ctx, mf.READ_WRITE, n * 32 * 4)
+        self.prog.pbkdf2_sha256_init(self.queue, (n,), None, *bufs + [state, np.uint32(n)])
+        self.queue.finish()
+        left = iters - 1
+        while left > 0:
+            rounds = min(left, self._rounds)
+            t0 = time.time()
+            self.prog.pbkdf2_sha256_rounds(self.queue, (n,), None, state, np.uint32(n), np.uint32(rounds))
+            self.queue.finish()
+            took = time.time() - t0
+            left -= rounds
+            if rounds == self._rounds:
+                scale = GPU_KDF_LAUNCH_SECS / max(took, 1e-4)
+                self._rounds = int(max(16, min(1 << 20, self._rounds * min(4.0, max(0.25, scale)))))
+        words = np.empty(n * 32, dtype=np.uint32)
+        cl.enqueue_copy(self.queue, words, state)
+        self.queue.finish()
+        t = words.reshape(n, 32)[:, 24:32].astype('>u4')
+        return [t[i].tobytes() for i in range(n)]
+
+    def selftest(self):
+        """Every byte of the derived keys must equal hashlib.pbkdf2_hmac, over
+        passwords either side of the 64-byte HMAC block (so the pre-hash is
+        covered), non-ASCII key strings, random salts, round counts that
+        split across launches unevenly, and the full GCM round count."""
+        lens = [0, 1, 3, 31, 32, 33, 55, 56, 57, 63, 64, 65, 100, 127, 128, 129, 200, 1000]
+        pws = [os.urandom(n) for n in lens]
+        pws += [_gcm_password(k) for k in ('Dev7', 'çğıöşü-ÇĞİÖŞÜ', 'дев7 €' * 9)]
+        salts = [os.urandom(GCM_SALT_LEN) for _ in pws]
+        saved = self._rounds
+        for iters, step in ((1, 256), (2, 256), (1000, 7), (5003, 256)):
+            self._rounds = step
+            got = self.derive(pws, salts, iters)
+            for p, s, d in zip(pws, salts, got):
+                if d != hashlib.pbkdf2_hmac('sha256', p, s, iters, 32):
+                    return False
+        self._rounds = saved
+        full = [pws[1], pws[-1]]
+        salt = os.urandom(GCM_SALT_LEN)
+        got = self.derive(full, salt, GCM_KDF_ITERS)
+        for p, d in zip(full, got):
+            if d != hashlib.pbkdf2_hmac('sha256', p, salt, GCM_KDF_ITERS, 32):
+                return False
+        return True
+
+def init_gpu_gcm(quiet=False):
+    """The GPU for the GCM files' key derivation, or None to use the CPU.
+    Like init_gpu, nothing is used until its self-test has matched the CPU."""
+    try:
+        import pyopencl
+    except Exception:
+        return None
+    try:
+        gpu = GpuPBKDF2()
+    except Exception as e:
+        if not quiet:
+            print('GPU unavailable for the GCM files (%s). Using the CPU for them.' % e)
+            print()
+        return None
+    try:
+        ok = gpu.selftest()
+    except Exception as e:
+        if not quiet:
+            print('GPU PBKDF2 self-test could not run on %s (%s). Using the CPU' % (gpu.name, e))
+            print('for the GCM files.')
+            print()
+        return None
+    if not ok:
+        if not quiet:
+            print('GPU PBKDF2 self-test FAILED on %s: its key derivation did not match' % gpu.name)
+            print('the CPU, so the GPU is not used for the GCM files. Using the CPU for them.')
+            print('Please report this device; the CPU path is unaffected.')
+            print()
+        return None
+    if not quiet:
+        print('GPU ready for the GCM files: %s (PBKDF2 self-test passed against hashlib).' % gpu.name)
+    return gpu
+
 def mirrored_path(out_root, src_path, flat=False):
     base = os.path.basename(src_path)[:-len(EXT)]
     if flat:
@@ -3157,7 +3572,7 @@ def run_once(argv):
     g_key.add_argument('--brute', action='store_true', help="if the known keys fail, generate and sweep candidates modelled on this crew's key history")
     g_key.add_argument('--deep', action='store_true', help='with --brute, widen every generator. Hours, not seconds')
     g_key.add_argument('--workers', type=int, default=None, metavar='N', help='parallel worker processes for the sweep. Defaults to every CPU core on this machine, to push the guessing as fast as the hardware allows. Set 1 to stay single-process, e.g. to keep a victim machine responsive')
-    g_key.add_argument('--gpu', action='store_true', help='use an OpenCL GPU (NVIDIA or AMD) for the sweep. Needs pyopencl and OpenCL drivers. Runs an AES self-test against the CPU first and falls back to the CPU unless it passes, so it can never return a wrong result or miss a key')
+    g_key.add_argument('--gpu', action='store_true', help='use an OpenCL GPU (NVIDIA or AMD) for the sweep: AES for the older files, the PBKDF2 key stretch for the GCM files. Needs pyopencl and OpenCL drivers. Each use runs a self-test against the CPU first and falls back to the CPU unless it passes, and the CPU checks every GCM key against the full tag, so it can never return a wrong result or miss a key')
     g_key.add_argument('--gpu-info', dest='gpu_info', action='store_true', help='list the OpenCL platforms and devices found, and exit')
     g_key.add_argument('--max-passes', type=int, default=8, help='how many times to sweep for keys. One pass can turn up several keys; each extra pass targets only the files no key covers yet, which is how an interrupted encryption run is picked up (default 8, 1 disables the extra passes)')
     g_key.add_argument('--max-candidates', type=int, help='give up after this many guesses')
@@ -3365,6 +3780,9 @@ def run_once(argv):
                 gpu = None
             elif not args.quiet:
                 print('GPU brute self-test passed (on-device candidates match the CPU).')
+        gcm_gpu = None
+        if args.gpu and any((gcm_shaped(sizes[f]) for f in files)):
+            gcm_gpu = init_gpu_gcm(quiet=args.quiet)
         gpu_active = gpu is not None
         gate_at = 5 * 10 ** 11 if gpu_active else 50000000
         gate_rate = 300000000.0 if gpu_active else 150000.0 if BACKEND != 'pure-python' else 2000.0
@@ -3455,17 +3873,18 @@ def run_once(argv):
                     STATUS.tech('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
                     STATUS.tech('stretch on these, so they get the supplied, recovered and variant keys;')
                     STATUS.tech('the fitted model and structural brute are left to the older files.')
-                    if gpu is not None:
-                        STATUS.tech('The GPU is not used for the GCM files.')
+                    if gcm_gpu is not None:
+                        STATUS.tech('The key stretch runs on the GPU (%s); the CPU checks every' % gcm_gpu.name)
+                        STATUS.tech('derived key against the full GCM tag.')
                     STATUS.say()
-                gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
+                gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
                 tried += gtried
                 merge(gmap, 'gcm')
                 aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
                 if gmap and aligned:
                     if not args.quiet:
                         STATUS.tech('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
-                    part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet)
+                    part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet, gpu=gcm_gpu)
                     merge(part, 'gcm')
                     ecb_cand = [f for f in ecb_cand if f not in file_scheme]
                 if ecb_cand and (not args.quiet):
@@ -3489,7 +3908,7 @@ def run_once(argv):
                 if aligned_closed and (budget_left() is None or budget_left() > 0):
                     if not args.quiet:
                         STATUS.tech('  checking %d block-aligned file(s) as AES-GCM before any brute force:' % len(aligned_closed))
-                    gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
+                    gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
                     tried += gtried
                     merge(gmap, 'gcm')
                 done = covered_now()
@@ -3512,13 +3931,13 @@ def run_once(argv):
             if ecb_keys and closed_gcm:
                 if not args.quiet:
                     STATUS.tech('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
-                merge(map_gcm_keys_to_files(closed_gcm, ecb_keys, workers=workers, quiet=args.quiet), 'gcm')
+                merge(map_gcm_keys_to_files(closed_gcm, ecb_keys, workers=workers, quiet=args.quiet, gpu=gcm_gpu), 'gcm')
             leftover = [f for f in leftover if f not in file_scheme]
             if leftover and (budget_left() is None or budget_left() > 0):
                 if not args.quiet:
                     STATUS.tech()
                     STATUS.tech('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
-                gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later)
+                gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
                 tried += gtried
                 merge(gmap, 'gcm')
         except SearchAbort:

@@ -1122,7 +1122,7 @@ def run_gui():
         refresh_review()
     c.addSpacing(4)
     c.addLayout(hbox((Toggle(V['gpu'], 'Use the graphics card (OpenCL)',
-                             'NVIDIA or AMD with OpenCL drivers. unmicro checks the GPU against the CPU first and falls back if it disagrees. Not used for the newer (GCM) files.',
+                             'NVIDIA or AMD with OpenCL drivers. unmicro checks the GPU against the CPU first and falls back if it disagrees. Speeds up both the older and the newer (GCM) files.',
                              command=lambda: (dumb_changed(), refresh_review())), 1),
                      (Btn('Check GPU', lambda: quick_run(['--gpu-info'], 'GPU check', need_license=False), 'ghost', small=True), 0, Qt.AlignVCenter),
                      spacing=16))
