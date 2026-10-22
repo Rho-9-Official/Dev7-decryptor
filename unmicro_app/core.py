@@ -94,13 +94,16 @@ def self_cmd():
             'from unmicro_app.launcher import main; sys.exit(main())', PKG_PARENT]
 
 
-def run_engine(args):
+def run_engine(args, hold_allowed=True):
     """Run the built-in engine exactly as the standalone unmicro binary
-    did: the same console set-up, error report and window hold."""
+    did: the same console set-up, error report and window hold.
+    hold_allowed=False under the window's hidden console: the engine is
+    alone on it there, which looks like a double-click, but nobody is
+    reading that console."""
     import traceback
     import unmicro
     unmicro.setup_console()
-    hold = unmicro.launched_by_double_click()
+    hold = hold_allowed and unmicro.launched_by_double_click()
     sys.argv = [sys.argv[0]] + list(args)  # main() reads sys.argv (and opens its menu when there are none)
     try:
         code = unmicro.main()
@@ -198,7 +201,7 @@ def _console_host(argv):
     me = self_cmd()
     if argv[:len(me)] == me and argv[len(me):len(me) + 1] == ['--engine']:
         win_std_streams(console_in=True)
-        return run_engine(argv[len(me) + 1:])
+        return run_engine(argv[len(me) + 1:], hold_allowed=False)
     conin = open('CONIN$', 'rb')
     child = subprocess.Popen(argv, stdin=conin)
     # Ctrl+C sent to the console reaches us too; only the child may act on it.
