@@ -104,7 +104,7 @@ machine and open it. Nothing else to install.
 | source (`python -m unmicro_app`, or `unmicro.py` on its own) | anything else, including Termux, ARM Linux and macOS | Python 3 |
 
 Both downloads are built by GitHub Actions straight from this repository and
-published on the [Releases](https://github.com/Rho-9-Official/Dev7-Decryptor-Tool/releases)
+published on the [Releases](https://github.com/Rho-9-Official/Dev7-decryptor/releases)
 page. They have a compiled AES back end inside, so they are fast out of the
 box and the harder searches are practical without installing anything.
 
@@ -122,7 +122,7 @@ pulls the program and the checksum file from this repository, refuses to
 continue if the checksum does not match, and then opens unmicro.
 
 ```powershell
-$repo = "https://github.com/Rho-9-Official/Dev7-Decryptor-Tool"
+$repo = "https://github.com/Rho-9-Official/Dev7-decryptor"
 $tag  = (curl.exe -fsSLI -o NUL -w "%{url_effective}" "$repo/releases/latest").Split('/')[-1]
 $f    = "unmicro-$($tag.TrimStart('v'))-windows-x86_64.exe"
 curl.exe -fLO "$repo/releases/download/$tag/$f"
@@ -145,7 +145,7 @@ signed, so this is expected. Verify the checksum as above, then choose
 ### Linux (recommended)
 
 ```bash
-repo=https://github.com/Rho-9-Official/Dev7-Decryptor-Tool
+repo=https://github.com/Rho-9-Official/Dev7-decryptor
 tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest"); tag=${tag##*/}
 f="unmicro-${tag#v}-linux-x86_64"
 curl -fLO "$repo/releases/download/$tag/$f"
@@ -162,8 +162,8 @@ glibc older than 2.35, run from source below.
 ### From source (Termux, ARM, macOS, or if you would rather read the code first)
 
 ```bash
-git clone https://github.com/Rho-9-Official/Dev7-Decryptor-Tool.git
-cd Dev7-Decryptor-Tool
+git clone https://github.com/Rho-9-Official/Dev7-decryptor.git
+cd Dev7-decryptor
 python3 -m unmicro_app                   # the window (pip install PySide6-Essentials for the modern one)
 python3 unmicro.py --auto --out ./recovered   # or the engine's command line on its own
 ```
@@ -172,7 +172,7 @@ The window needs nothing beyond Python (it falls back to a classic Tk window
 without PySide6). The engine on its own is the single file `unmicro.py`:
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/Rho-9-Official/Dev7-Decryptor-Tool/main/unmicro.py
+curl -fLO https://raw.githubusercontent.com/Rho-9-Official/Dev7-decryptor/main/unmicro.py
 python3 unmicro.py --auto --out ./recovered
 ```
 
@@ -184,7 +184,7 @@ Every release file carries a GitHub build attestation tying it to the exact
 commit and workflow run that produced it. With the GitHub CLI installed:
 
 ```
-gh attestation verify <file> --repo Rho-9-Official/Dev7-Decryptor-Tool
+gh attestation verify <file> --repo Rho-9-Official/Dev7-decryptor
 ```
 
 A pass means the file was built by this repository's own workflow, not
