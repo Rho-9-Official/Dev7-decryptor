@@ -141,7 +141,8 @@ def _helper_cmd():
     # the GUI entry point (frozen exe or unmicro_qt.py) dispatches helper modes
     if getattr(sys, 'frozen', False):
         return [sys.executable]
-    return [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'unmicro_qt.py')]
+    # whichever UI script started us handles the helper modes
+    return [sys.executable, os.path.abspath(sys.argv[0])]
 
 
 # --------------------------------------------------------------------------
