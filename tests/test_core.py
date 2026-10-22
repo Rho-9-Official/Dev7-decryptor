@@ -190,5 +190,95 @@ class Estimates(unittest.TestCase):
         self.assertTrue(g.fmt_duration(1e30).startswith('10^'))
 
 
+class Shared(unittest.TestCase):
+    """What both UIs compute through the core."""
+
+    def test_split_lines_keeps_tail(self):
+        lines, tail = g.split_lines('a\nb\r\nprogress\rChoose [1]: ')
+        self.assertEqual(lines, [('a', '\n'), ('b', '\r\n'), ('progress', '\r')])
+        self.assertEqual(tail, 'Choose [1]: ')
+
+    def test_classify_prompt(self):
+        self.assertEqual(g.classify_prompt('Choose [1]: '), ('pause', None))
+        self.assertEqual(g.classify_prompt('Keep going into 5-character keys? [y/N] '), ('gate', 5))
+        self.assertEqual(g.classify_prompt('Press Enter to close this window.  '), ('close', None))
+        self.assertEqual(g.classify_prompt('License key: '), ('license', None))
+        self.assertIsNone(g.classify_prompt('Still searching'))
+        self.assertIsNone(g.classify_prompt(''))
+
+    def test_count_limit_hits_needs_six_in_a_row(self):
+        hits = {}
+        for _ in range(5):
+            self.assertFalse(g.count_limit_hits(hits, {'temp': 'CPU at 99'}))
+        self.assertFalse(g.count_limit_hits(hits, {}))  # back under: count resets
+        self.assertEqual(hits, {})
+        for _ in range(5):
+            g.count_limit_hits(hits, {'temp': 'x'})
+        self.assertTrue(g.count_limit_hits(hits, {'temp': 'x'}))
+
+    def test_finish_snapshot(self):
+        s = g.finish_snapshot(cfg(checkpoint_on=True, checkpoint='', workers=12), 12)
+        self.assertEqual(s['checkpoint'], os.path.join('/cases/out', 'unmicro-progress.checkpoint'))
+        self.assertEqual(s['workers'], 0)
+        self.assertEqual(g.finish_snapshot(cfg(workers=4), 12)['workers'], 4)
+
+    def test_keydata_from_list(self):
+        kd = g.keydata_from_list('zarox\nab12\n\n')
+        self.assertEqual(kd['keys'], ['zarox', 'ab12'])
+        self.assertEqual(kd['max_len'], 5)
+        self.assertIsNone(g.keydata_from_list('  \n'))
+
+    def test_summary_and_command_preview(self):
+        s = cfg(dumb=True, dumb_mode='endless', keys=['k'], workers=0)
+        rows = dict(g.summary(s, 8))
+        self.assertIn('UNTIL THE MACHINE CANNOT TAKE IT', rows['Search'])
+        self.assertEqual(rows['Machine'], 'all 8 cores')
+        cmd = g.command_preview(g.Engine('/x/unmicro'), s)
+        self.assertTrue(cmd.startswith('UNMICRO_LICENSE=\u2026 /x/unmicro'))
+        self.assertNotIn(' K ', cmd + ' ')
+        self.assertIn('<file list>', g.command_preview(g.Engine('/x/unmicro'), cfg(paths=['/a', '/b'])))
+
+    def test_estimate_table(self):
+        head, rows, foot = g.estimate_table(dict(g.DEFAULTS), cfg(charset='observed', workers=0, gpu=False), 4)
+        self.assertTrue(head.startswith('61 characters, lengths 1 to 30'))
+        self.assertEqual([r[0] for r in rows], [str(n) for n in range(1, 11)])
+        self.assertEqual(rows[0][4], 'ok')
+        self.assertEqual(rows[-1][4], 'bad')
+        self.assertIn('longest recovered key has 30', foot)
+
+    def test_length_progress_and_search_left(self):
+        self.assertIsNone(g.length_progress('recovered keys', 10, 0, 100.0, 10, 5))
+        lp = g.length_progress('structural brute len=3', 600, 100, 100.0, 10, 5)
+        self.assertAlmostEqual(lp['frac'], 0.5)
+        self.assertIn('of up to 5', lp['method'])
+        left = g.search_left_secs(10, 5, 100.0, 'structural brute len=3', 600, 100)
+        self.assertAlmostEqual(left, (500 + 10 ** 4 + 10 ** 5) / 100.0)
+
+    def test_meter_readings_tones(self):
+        lims = {'max_temp': 90, 'max_ram': 90, 'min_disk_gb': 2, 'min_battery': 15}
+        m = g.meter_readings({'cpu': 50, 'ram': 85, 'temp': 95, 'disk_free_gb': 50, 'battery': None}, lims)
+        self.assertEqual(m['ram'][2], 'warn')
+        self.assertEqual(m['temp'][2], 'bad')
+        self.assertEqual(m['temp'][1], 100)
+        self.assertIsNone(m['disk'][2])
+        self.assertNotIn('battery', m)
+
+    def test_ttf_text_keeps_units(self):
+        head, sub = g.ttf_text(0, 'CPU reaches 50\u00b0C', [('CPU reaches 50\u00b0C', 0, 'limit already reached')])
+        self.assertEqual(head, 'Time to failure: now (CPU reaches 50\u00b0C)')
+        head, _ = g.ttf_text(7200, 'Search space runs out', [])
+        self.assertEqual(head, 'Time to failure: about 2.0 hours (search space runs out)')
+
+    def test_record_speed(self):
+        c = {}
+        g.record_speed(c, [100.0, 300.0, 200.0], 4, False)
+        self.assertEqual(c['measured']['per_worker'], 50.0)
+
+    def test_bird_polygon(self):
+        pts = g.bird_polygon(2.0, 1.0, 1.0)
+        self.assertEqual(pts[0], (7.0, 29.0))
+        self.assertGreater(len(pts), 40)
+
+
 if __name__ == '__main__':
     unittest.main()

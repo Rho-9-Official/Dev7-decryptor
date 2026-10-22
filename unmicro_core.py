@@ -5,8 +5,8 @@ Rho-9 Systems. Styled after Aviary (Hyper dark).
 
 The GUI never decrypts anything itself. It builds an unmicro command line from
 the choices on its tabs, runs the already built binary (or unmicro.py), and
-reads its output. Pure standard library (tkinter), so the same file runs on
-Windows, macOS and Linux.
+reads its output. Pure standard library, shared by the Tk UI (unmicro_gui.py)
+and the PySide6 UI (unmicro_qt.py), on Windows, macOS and Linux.
 
 The binary is driven the way a person at a terminal would drive it: its
 standard input is a terminal (a pty on Linux/macOS, a hidden console on
@@ -495,6 +495,350 @@ def classify_tag(text):
     return None
 
 
+def split_lines(buf):
+    """Split buffered output into complete lines. Returns
+    ([(line, separator)], unfinished tail)."""
+    parts = re.split(r'(\r\n|\n|\r)', buf)
+    return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)], parts[-1]
+
+
+def classify_prompt(tail):
+    """What the unfinished last output line is asking, if anything:
+    ('pause', None), ('gate', length), ('close', None), ('license', None)
+    or None."""
+    if not tail:
+        return None
+    if tail.endswith(PROMPT_PAUSE):
+        return ('pause', None)
+    m = RE_GATE.search(tail)
+    if m:
+        return ('gate', int(m.group(1)))
+    if tail.rstrip().endswith(PROMPT_CLOSE):
+        return ('close', None)
+    if tail.endswith(PROMPT_LICENSE):
+        return ('license', None)
+    return None
+
+
+# Shared by both UIs: everything they show that is computed, not drawn -----
+
+# Aviary's bird (24x24 SVG path; the eye is at 16,8)
+BIRD = 'M3 14c2-1 4-3 6-6 1 3 3 4 6 4 2 0 4-1 5-3 0 4-2 7-5 8l3 4-4-1-2 3-1-3-4 1 2-3c-4 0-7-2-9-5z'
+BIRD_EYE = (16, 8, 1.2)
+
+
+def bird_polygon(scale=1.0, ox=0.0, oy=0.0):
+    """The bird as a polygon (curves flattened), scaled and offset."""
+    toks = re.findall(r'[MmCcLlZz]|-?\d*\.?\d+', BIRD)
+    pts, i, cmd = [], 0, None
+    x = y = 0.0
+    while i < len(toks):
+        t = toks[i]
+        if t in 'MmCcLlZz':
+            cmd = t
+            i += 1
+            continue
+        if cmd == 'M':
+            x, y = float(toks[i]), float(toks[i + 1])
+            i += 2
+            pts.append((x, y))
+            cmd = 'l'
+        elif cmd in 'lL':
+            dx, dy = float(toks[i]), float(toks[i + 1])
+            i += 2
+            x, y = (x + dx, y + dy) if cmd == 'l' else (dx, dy)
+            pts.append((x, y))
+        elif cmd in 'cC':
+            v = [float(toks[i + k]) for k in range(6)]
+            i += 6
+            if cmd == 'c':
+                v = [x + v[0], y + v[1], x + v[2], y + v[3], x + v[4], y + v[5]]
+            for s in range(1, 9):
+                tt = s / 8.0
+                mt = 1 - tt
+                px = mt ** 3 * x + 3 * mt * mt * tt * v[0] + 3 * mt * tt * tt * v[2] + tt ** 3 * v[4]
+                py = mt ** 3 * y + 3 * mt * mt * tt * v[1] + 3 * mt * tt * tt * v[3] + tt ** 3 * v[5]
+                pts.append((px, py))
+            x, y = v[4], v[5]
+        else:
+            i += 1
+    return [(ox + px * scale, oy + py * scale) for px, py in pts]
+
+
+def alpha_and_max(cfg, charset):
+    """(alphabet size, longest key length) for the structural brute force."""
+    kd = cfg.get('keydata') or {}
+    sizes = kd.get('alphabets') or DEFAULT_ALPHABETS
+    return sizes.get(charset, DEFAULT_ALPHABETS['turkish']), kd.get('max_len') or DEFAULT_MAX_LEN
+
+
+def finish_snapshot(s, cpu_n):
+    """Fill in what the tabs leave implicit: the default checkpoint file, and
+    0 workers (= unmicro's default, every core) when all cores are chosen."""
+    if s.get('checkpoint_on') and not s.get('checkpoint') and s.get('out'):
+        s['checkpoint'] = os.path.join(s['out'], 'unmicro-progress.checkpoint')
+    if (s.get('workers') or 0) >= cpu_n:
+        s['workers'] = 0
+    return s
+
+
+def keydata_from_list(out, version=None):
+    """keydata from --list-keys output (one recovered key per line)."""
+    keys = [ln for ln in out.splitlines() if ln.strip()]
+    if not keys:
+        return None
+    return {'keys': keys, 'alphabets': alphabet_sizes(keys), 'max_len': max(len(k) for k in keys), 'version': version}
+
+
+def summary(s, cpu_n):
+    """The Run tab's review: [(heading, text)]."""
+    out = []
+    if s['source'] == 'auto':
+        out.append(('Files', 'Search the whole computer' + (' plus %d extra place(s)' % len(s['scan_roots']) if s['scan_roots'] else '') + (', system folders included' if s['no_prune'] else '')))
+    elif s['source'] == 'list':
+        out.append(('Files', 'The files listed in %s' % (s['file_list'] or '(not chosen)')))
+    else:
+        n = len(s['paths'])
+        out.append(('Files', ('%d place(s): %s' % (n, '; '.join(s['paths'][:3]) + (' \u2026' if n > 3 else ''))) if n else '(nothing chosen)'))
+    k = []
+    if s['keys']:
+        k.append('%d key(s) you typed' % len(s['keys']))
+    if s['wordlist']:
+        k.append('a wordlist')
+    if s['scavenge']:
+        k.append('%d dump(s)' % len(s['scavenge']))
+    k.append('the recovered operator keys')
+    out.append(('Keys', ', '.join(k)))
+    lv = {'quick': 'Quick', 'standard': 'Standard (likely variations)', 'deep': 'Deep (widened variations)'}[s['level']]
+    if s['dumb']:
+        mode = {'ask': 'asking before long lengths', 'keepgoing': 'every length without asking', 'endless': 'UNTIL THE MACHINE CANNOT TAKE IT'}[s['dumb_mode']]
+        lv += '; then every possible key, %s alphabet, %s' % (s['charset'], mode)
+    out.append(('Search', lv))
+    out.append(('Machine', '%s%s%s' % ('all %d cores' % cpu_n if not s['workers'] else '%d of %d cores' % (s['workers'], cpu_n),
+                                       ', GPU' if s['gpu'] else '', (', stop after %s guesses' % s['max_candidates']) if s['max_candidates'] and not (s['dumb'] and s['dumb_mode'] == 'endless') else '')))
+    if s['identify']:
+        out.append(('Output', 'Key check only: nothing is written'))
+    else:
+        out.append(('Output', '%s%s%s' % (s['out'] or '(not chosen)', ', one folder' if s['flat'] else '', {'normal': '', 'strict': ', strict checking', 'keep': ', keep unverified files'}[s['verify']])))
+    return out
+
+
+def command_preview(engine, s):
+    """The copyable command for the Run tab. The licence is shown as an
+    environment variable with its value elided, never on the command line."""
+    args = build_args(s, '<file list>' if s['source'] == 'folders' and len(s['paths']) > 1 else None)
+    env_hint = ('set %s=\u2026 && ' % LICENSE_ENV) if WINDOWS else ('%s=\u2026 ' % LICENSE_ENV)
+    return env_hint + ' '.join(quote_arg(x) for x in engine.argv(args))
+
+
+def schedule_tone(cum_secs):
+    """'ok' under an hour, 'warn' under a month, else 'bad'."""
+    return 'ok' if cum_secs < 3600 else ('warn' if cum_secs < 86400 * 30 else 'bad')
+
+
+def estimate_table(cfg, s, cpu_n):
+    """The Search tab's brute-force estimate: (heading, rows, footer).
+    rows: [(length, keys, this length, total so far, tone)]."""
+    alpha, maxlen = alpha_and_max(cfg, s['charset'])
+    workers = s['workers'] or cpu_n
+    rate = estimate_rate(cfg, workers, s['gpu'])
+    measured = bool((cfg.get('measured') or {}).get('per_worker'))
+    head = '%d characters, lengths 1 to %d, about %s keys/s on %s %s' % (
+        alpha, maxlen, fmt_count(rate), ('the GPU' if s['gpu'] else '%d core(s)' % workers),
+        '(measured)' if measured else '(rough guess until a run measures it)')
+    sched = brute_schedule(alpha, maxlen, rate)
+    shown = [r for r in sched if r[0] <= 4] + [r for r in sched if r[0] > 4][:6]
+    rows = [(str(L), '{:.3g}'.format(size) if size > 1e12 else fmt_count(size), fmt_duration(secs), fmt_duration(cum), schedule_tone(cum))
+            for L, size, secs, cum in shown]
+    foot = 'In a day this machine finishes keys up to %d characters; in a year, up to %d. The longest recovered key has %d.' % (
+        reachable_length(sched, 86400), reachable_length(sched, 365.25 * 86400), maxlen)
+    return head, rows, foot
+
+
+def length_progress(name, tried, tier_start, rate, alpha, maxlen):
+    """Progress through the current structural brute-force length, or None
+    when the method running is not the structural brute force.
+    Returns {'method', 'frac', 'detail'}."""
+    m = RE_BRUTE_LEN.search(name or '')
+    if not m:
+        return None
+    L = int(m.group(1))
+    size = alpha ** L
+    done = max(0, tried - tier_start)
+    frac = min(1.0, done / float(size))
+    left = (size - done) / rate if rate > 0 else None
+    return {'method': 'Every possible key of %d characters (of up to %d)' % (L, maxlen), 'frac': frac,
+            'detail': '%s of %s keys of this length (%.2f%%), about %s left for this length' % (
+                fmt_count(done), '{:.3g}'.format(size) if size > 1e12 else fmt_count(size), frac * 100, fmt_duration(left))}
+
+
+def live_rate(rates, cfg, workers, gpu):
+    """The brute-force speed now: the last 10 readings, else the estimate."""
+    recent = rates[-10:]
+    return (sum(recent) / len(recent)) if recent else estimate_rate(cfg, workers, gpu)
+
+
+def search_left_secs(alpha, maxlen, rate, tier, tried, tier_start):
+    """Seconds until the structural brute force has tried every length."""
+    sched = brute_schedule(alpha, maxlen, rate)
+    m = RE_BRUTE_LEN.search(tier or '')
+    if not m:
+        return sched[-1][3]
+    L = int(m.group(1))
+    done = max(0, tried - tier_start)
+    left = sum(r[1] for r in sched if r[0] > L) + max(0, alpha ** L - done)
+    return left / max(rate, 1)
+
+
+def phrase(label):
+    """A label as part of a sentence: 'Search space runs out' -> 'search
+    space runs out', but 'CPU reaches 95\u00b0C' keeps its capitals."""
+    return label[:1].lower() + label[1:] if label[1:2].islower() else label
+
+
+def ttf_text(secs, why, details):
+    """(headline, detail line) for a live time to failure."""
+    when = 'now' if secs is not None and secs < 1 else 'about %s' % fmt_duration(secs)
+    return ('Time to failure: %s (%s)' % (when, phrase(why)),
+            '  \u00b7  '.join('%s: %s' % (lbl, fmt_duration(v) if v is not None else 'measuring') for lbl, v, _ in details))
+
+
+def endless_estimate(cfg, s, cpu_n, res, lims):
+    """Everything the endless-mode warning shows."""
+    alpha, maxlen = alpha_and_max(cfg, s['charset'])
+    workers = s['workers'] or cpu_n
+    rate = estimate_rate(cfg, workers, s['gpu'])
+    sched = brute_schedule(alpha, maxlen, rate)
+    secs, why, details = time_to_failure(sched[-1][3], res, lims, {})
+    return {'alpha': alpha, 'maxlen': maxlen, 'workers': workers, 'rate': rate, 'secs': secs, 'why': why, 'details': details,
+            'measured': bool((cfg.get('measured') or {}).get('per_worker')),
+            'day': reachable_length(sched, 86400), 'week': reachable_length(sched, 7 * 86400),
+            'year': reachable_length(sched, 365.25 * 86400), 'temp': (res or {}).get('temp')}
+
+
+METERS = (('cpu', 'CPU'), ('ram', 'Memory'), ('temp', 'CPU temperature'), ('disk', 'Free disk (output)'), ('battery', 'Battery'))
+
+
+def meter_readings(s, lims):
+    """{meter: (text, percent of the bar, tone 'bad'|'warn'|None)} for the
+    readings this sample has."""
+    out = {}
+    if s.get('cpu') is not None:
+        out['cpu'] = ('%.0f%%' % s['cpu'], s['cpu'], None)
+    if s.get('ram') is not None:
+        r = s['ram']
+        out['ram'] = ('%.0f%%' % r, r, 'bad' if r >= lims['max_ram'] else ('warn' if r >= lims['max_ram'] - 8 else None))
+    if s.get('temp') is not None:
+        t = s['temp']
+        out['temp'] = ('%.0f°C' % t, t / lims['max_temp'] * 100,
+                       'bad' if t >= lims['max_temp'] else ('warn' if t >= lims['max_temp'] - 10 else None))
+    if s.get('disk_free_gb') is not None:
+        d, lo = s['disk_free_gb'], lims['min_disk_gb']
+        out['disk'] = ('%.1f GB' % d, min(100, d / max(lo * 10, 1) * 100), 'bad' if d <= lo else ('warn' if d <= lo * 2 else None))
+    if s.get('battery') is not None:
+        b, lo, on = s['battery'], lims['min_battery'], s.get('on_battery')
+        out['battery'] = ('%.0f%%%s' % (b, ' on battery' if on else ' plugged in'), b,
+                          'bad' if on and b <= lo else ('warn' if on and b <= lo + 10 else None))
+    for k, (text, frac, tone) in list(out.items()):
+        out[k] = (text, max(0, min(100, frac)), tone)
+    return out
+
+
+LIMIT_READINGS = 6  # readings in a row (5 s apart) before a safety limit trips
+
+
+def count_limit_hits(hits, tripped, need=LIMIT_READINGS):
+    """Update the consecutive-reading counts in hits (in place) from this
+    reading's tripped limits; True once any limit has held for need readings.
+    A reading back under a limit resets its count."""
+    for k in tripped:
+        hits[k] = hits.get(k, 0) + 1
+    for k in list(hits):
+        if k not in tripped:
+            hits.pop(k)
+    return any(v >= need for v in hits.values())
+
+
+def record_speed(cfg, rates, workers, gpu):
+    """Remember the median brute-force speed for future estimates."""
+    if not rates:
+        return
+    med = sorted(rates)[len(rates) // 2]
+    if gpu:
+        cfg.setdefault('measured', {})['gpu_rate'] = med
+    else:
+        cfg.setdefault('measured', {})['per_worker'] = med / max(1, workers)
+
+
+def scan_places(source, paths, file_list, scan_roots):
+    """Where "Find files" looks: (places, error text or None)."""
+    if source == 'folders':
+        places = list(paths)
+    elif source == 'list':
+        try:
+            with open(file_list, encoding='utf-8', errors='replace') as fh:
+                places = [ln.strip() for ln in fh if ln.strip()]
+        except OSError as ex:
+            return [], 'Could not read the list: %s' % ex
+    else:
+        if WINDOWS:
+            places = ['%s:\\' % d for d in 'CDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.exists('%s:\\' % d)]
+        else:
+            places = [os.path.expanduser('~'), '/media', '/mnt', '/Volumes'] + list(scan_roots)
+        places = [p for p in places if os.path.exists(p)]
+    return places, None
+
+
+def scan_status(n, nbytes, kinds, done):
+    """The preview's status line and its tone ('ok', 'warn' or 'muted')."""
+    ks = ', '.join('%s %s' % (fmt_count(v), k) for k, v in sorted(kinds.items()))
+    text = '%s %s file(s), %s%s' % ('Found' if done else 'Searching\u2026', fmt_count(n), fmt_bytes(nbytes), (': ' + ks) if ks else '')
+    return text, ('ok' if done and n else ('warn' if done else 'muted'))
+
+
+def write_file_list(paths, recursive):
+    """Collect the encrypted files under several places into a temporary
+    file list; returns its path, or None when there are none."""
+    items = [p for p, _ in find_encrypted(paths, recursive)]
+    if not items:
+        return None
+    fd, path = tempfile.mkstemp(prefix='unmicro-files-', suffix='.txt')
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(items) + '\n')
+    return path
+
+
+def open_path(p):
+    """Open a folder in the system file manager. Returns an error text or
+    None."""
+    if not p:
+        return None
+    if not os.path.exists(p):
+        return 'The folder does not exist yet:\n%s' % p
+    try:
+        if WINDOWS:
+            os.startfile(p)
+        elif MACOS:
+            subprocess.Popen(['open', p])
+        else:
+            subprocess.Popen(['xdg-open', p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        return str(ex)
+    return None
+
+
+def engine_verdict(rc, out):
+    """(ok, chip text, detail text, version or None) for --version output."""
+    first = out.strip().splitlines()[-1] if out.strip() else ''
+    if rc == 0 and 'unmicro' in out:
+        ver = first.split()[-1]
+        return True, 'unmicro %s' % ver, 'Ready: %s' % first, ver
+    hint = ''
+    if 'GLIBC' in out:
+        hint = '\nThis Linux build needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+). On an older system choose unmicro.py instead (needs Python 3; pip install pycryptodome makes it fast).'
+    return False, 'not working', 'The engine did not start: %s%s' % (out.strip()[-400:], hint), None
+
+
 # --------------------------------------------------------------------------
 # Resource monitor (stdlib; uses psutil when it is installed)
 # --------------------------------------------------------------------------
@@ -954,7 +1298,7 @@ DEFAULTS = {
     'workers': 0, 'gpu': False, 'max_passes': 8, 'max_candidates': '', 'checkpoint_on': True, 'checkpoint': '',
     'seen_cap': 1000000, 'pure_python': False,
     'out': '', 'identify': False, 'flat': False, 'overwrite': False, 'verify': 'normal', 'fix_ext': True, 'force': False,
-    'engine': '', 'python': '',
+    'engine': '', 'python': '', 'ui': '',
     'limits': {'max_temp': 95, 'max_ram': 92, 'min_disk_gb': 2, 'min_battery': 15},
     'measured': {}, 'keydata': {},
 }

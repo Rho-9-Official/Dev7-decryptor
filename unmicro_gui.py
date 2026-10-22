@@ -6,7 +6,8 @@ Rho-9 Systems. Styled after Aviary (Hyper dark).
 The GUI never decrypts anything itself. It builds an unmicro command line from
 the choices on its tabs, runs the already built binary (or unmicro.py), and
 reads its output. Pure standard library (tkinter), so the same file runs on
-Windows, macOS and Linux.
+Windows, macOS and Linux. Everything that is not a widget lives in
+unmicro_core, shared with the PySide6 UI (unmicro_qt.py).
 
 The binary is driven the way a person at a terminal would drive it: its
 standard input is a terminal (a pty on Linux/macOS, a hidden console on
@@ -16,50 +17,11 @@ recover the files already matched). Run non-interactively it hangs inside the
 worker pool instead. The same channel answers the "keep going into
 N-character keys?" question with a dialog.
 """
-import codecs
-import json
-import math
 import os
 import queue
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-
-APP_NAME = 'unmicro'
-APP_VERSION = '0.1.0'
-WINDOWS = os.name == 'nt'
-MACOS = sys.platform == 'darwin'
-EXT = '.cryptedmicro'
-LICENSE_ENV = 'UNMICRO_LICENSE'
-CONTACT = 'recon@rho-9.com'
-
-# Aviary's palette (webgui/index.html :root)
-C = {
-    'body': '#323a46', 'card': '#37424c', 'card2': '#3b4651', 'topbar': '#3c4752',
-    'hover': '#424e5a', 'border': '#464f5b', 'input': '#2b323c',
-    'text': '#aab8c5', 'muted': '#8391a2', 'faint': '#6c757d', 'bright': '#e3eaef',
-    'navtext': '#919eab', 'navhover': '#bccee4',
-    'primary': '#727cf5', 'primary_hover': '#6169e0', 'success': '#0acf97',
-    'info': '#39afd1', 'warning': '#ffc35a', 'danger': '#fa5c7c', 'thumb': '#5a6570',
-}
-
-# What the recovered-key data of 3.9.1 gives; replaced by the real numbers
-# once the licence is checked (--list-keys).
-DEFAULT_ALPHABETS = {'observed': 61, 'turkish': 67, 'full': 77}
-DEFAULT_MAX_LEN = 30
-ENGLISH_LOWER = 'abcdefghijklmnopqrstuvwxyz'
-TURKISH_LOWER = '\u00e7\u011f\u0131\u00f6\u015f\u00fc'
-TURKISH_UPPER = '\u00c7\u011e\u0130\u00d6\u015e\u00dc'
-DIGITS = '0123456789'
-# Speed per CPU worker when nothing has been measured yet (pycryptodome back
-# end, AES-ECB one block per guess; measured at 37-65k/s per core).
-DEFAULT_RATE_PER_WORKER = 37500.0
-DEFAULT_GPU_RATE = 3.0e8
-
 
 from unmicro_core import *  # noqa: F401,F403  (shared with the Qt UI)
 from unmicro_core import _helper_cmd, helper_main  # noqa: F401
@@ -131,46 +93,6 @@ def run_gui():
     root.geometry('%dx%d+%d+%d' % (w, h, (sw - w) // 2, max(0, (sh - h) // 3)))
 
     # ---------------- logo (Aviary's bird, rasterised) -----------------
-    BIRD = 'M3 14c2-1 4-3 6-6 1 3 3 4 6 4 2 0 4-1 5-3 0 4-2 7-5 8l3 4-4-1-2 3-1-3-4 1 2-3c-4 0-7-2-9-5z'
-
-    def bird_polygon(scale, ox, oy):
-        toks = re.findall(r'[MmCcLlZz]|-?\d*\.?\d+', BIRD)
-        pts, i, cmd = [], 0, None
-        x = y = 0.0
-        while i < len(toks):
-            t = toks[i]
-            if t in 'MmCcLlZz':
-                cmd = t
-                i += 1
-                if t in 'Zz':
-                    continue
-                continue
-            if cmd == 'M':
-                x, y = float(toks[i]), float(toks[i + 1])
-                i += 2
-                pts.append((x, y))
-                cmd = 'l'
-            elif cmd in 'lL':
-                dx, dy = float(toks[i]), float(toks[i + 1])
-                i += 2
-                x, y = (x + dx, y + dy) if cmd == 'l' else (dx, dy)
-                pts.append((x, y))
-            elif cmd in 'cC':
-                v = [float(toks[i + k]) for k in range(6)]
-                i += 6
-                if cmd == 'c':
-                    v = [x + v[0], y + v[1], x + v[2], y + v[3], x + v[4], y + v[5]]
-                for s in range(1, 9):
-                    tt = s / 8.0
-                    mt = 1 - tt
-                    px = mt ** 3 * x + 3 * mt * mt * tt * v[0] + 3 * mt * tt * tt * v[2] + tt ** 3 * v[4]
-                    py = mt ** 3 * y + 3 * mt * mt * tt * v[1] + 3 * mt * tt * tt * v[3] + tt ** 3 * v[5]
-                    pts.append((px, py))
-                x, y = v[4], v[5]
-            else:
-                i += 1
-        return [(ox + px * scale, oy + py * scale) for px, py in pts]
-
     def draw_mark(cv, size):
         r = max(4, size // 5)
         p = C['primary']
@@ -182,7 +104,7 @@ def run_gui():
         off = size * 0.2
         poly = bird_polygon(sc, off, off)
         cv.create_polygon([c for pt in poly for c in pt], fill='#ffffff', outline='', smooth=False)
-        ex, ey, er = off + 16 * sc, off + 8 * sc, 1.2 * sc
+        ex, ey, er = off + BIRD_EYE[0] * sc, off + BIRD_EYE[1] * sc, BIRD_EYE[2] * sc
         cv.create_oval(ex - er, ey - er, ex + er, ey + er, fill=C['topbar'], outline='')
 
     def icon_image(size=32):
@@ -556,11 +478,7 @@ def run_gui():
                 out['limits'][k] = v.get()
             except (tk.TclError, ValueError):
                 out['limits'][k] = DEFAULTS['limits'][k]
-        if out.get('checkpoint_on') and not out.get('checkpoint') and out.get('out'):
-            out['checkpoint'] = os.path.join(out['out'], 'unmicro-progress.checkpoint')
-        if out.get('workers', 0) >= cpu_n:
-            out['workers'] = 0
-        return out
+        return finish_snapshot(out, cpu_n)
     keys_text = None
     ready = {'v': False}
 
@@ -811,21 +729,10 @@ def run_gui():
             scan_state['cancel'].set()
             return
         s = V['source'].get()
-        if s == 'folders':
-            places = list(lists['paths'])
-        elif s == 'list':
-            try:
-                with open(V['file_list'].get(), encoding='utf-8', errors='replace') as fh:
-                    places = [ln.strip() for ln in fh if ln.strip()]
-            except OSError as ex:
-                pv_status.configure(text='Could not read the list: %s' % ex, fg=C['danger'])
-                return
-        else:
-            if WINDOWS:
-                places = ['%s:\\' % d for d in 'CDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.exists('%s:\\' % d)]
-            else:
-                places = [os.path.expanduser('~'), '/media', '/mnt', '/Volumes'] + lists['scan_roots']
-            places = [p for p in places if os.path.exists(p)]
+        places, err = scan_places(s, lists['paths'], V['file_list'].get(), lists['scan_roots'])
+        if err:
+            pv_status.configure(text=err, fg=C['danger'])
+            return
         if not places:
             pv_status.configure(text='Nothing chosen yet.', fg=C['warning'])
             return
@@ -862,9 +769,8 @@ def run_gui():
                         tree.insert('', 'end', values=(fmt_bytes(size), fmt, p))
             except queue.Empty:
                 pass
-            kinds = ', '.join('%s %s' % (fmt_count(v), k) for k, v in sorted(tot['kinds'].items()))
-            pv_status.configure(text='%s %s file(s), %s%s' % ('Found' if done else 'Searching\u2026', fmt_count(tot['n']), fmt_bytes(tot['b']), (': ' + kinds) if kinds else ''),
-                                fg=C['success'] if done and tot['n'] else (C['warning'] if done else C['muted']))
+            text, tone = scan_status(tot['n'], tot['b'], tot['kinds'], done)
+            pv_status.configure(text=text, fg={'ok': C['success'], 'warn': C['warning']}.get(tone, C['muted']))
             if done:
                 scan_state['cancel'] = None
                 find_btn.configure(text='Find files')
@@ -1007,32 +913,16 @@ def run_gui():
     def draw_estimates():
         for wdg in est_tbl.winfo_children():
             wdg.destroy()
-        s = snapshot()
-        alpha, maxlen = alpha_and_max(s['charset'])
-        rate = estimate_rate(cfg, s['workers'] or cpu_n, s['gpu'])
-        measured = bool((cfg.get('measured') or {}).get('per_worker'))
-        est_head.configure(text='%d characters, lengths 1 to %d, about %s keys/s on %s %s' % (
-            alpha, maxlen, fmt_count(rate), ('the GPU' if s['gpu'] else '%d core(s)' % (s['workers'] or cpu_n)),
-            '(measured)' if measured else '(rough guess until a run measures it)'))
-        sched = brute_schedule(alpha, maxlen, rate)
+        head, rows, foot = estimate_table(cfg, snapshot(), cpu_n)
+        est_head.configure(text=head)
         hdrs = ('Length', 'Keys to try', 'This length', 'Total so far')
         for j, h in enumerate(hdrs):
             lbl(est_tbl, h, fg=C['muted'], font=F['tiny'], bg=C['card2']).grid(row=0, column=j, sticky='w', padx=(0, 28))
-        shown = [r for r in sched if r[0] <= 4] + [r for r in sched if r[0] > 4][:6]
-        for i, (L, size, secs, cum) in enumerate(shown, 1):
-            col = C['success'] if cum < 3600 else (C['warning'] if cum < 86400 * 30 else C['danger'])
-            vals = (str(L), '{:.3g}'.format(size) if size > 1e12 else fmt_count(size), fmt_duration(secs), fmt_duration(cum))
-            for j, v in enumerate(vals):
-                lbl(est_tbl, v, fg=col if j == 3 else C['text'], font=F['monos'], bg=C['card2']).grid(row=i, column=j, sticky='w', padx=(0, 28))
-        day = reachable_length(sched, 86400)
-        yr = reachable_length(sched, 365.25 * 86400)
-        lbl(est_tbl, 'In a day this machine finishes keys up to %d characters; in a year, up to %d. The longest recovered key has %d.' % (day, yr, maxlen),
-            fg=C['muted'], font=F['small'], bg=C['card2']).grid(row=len(shown) + 1, column=0, columnspan=4, sticky='w', pady=(8, 0))
-
-    def alpha_and_max(charset):
-        kd = cfg.get('keydata') or {}
-        sizes = kd.get('alphabets') or DEFAULT_ALPHABETS
-        return sizes.get(charset, DEFAULT_ALPHABETS['turkish']), kd.get('max_len') or DEFAULT_MAX_LEN
+        tones = {'ok': C['success'], 'warn': C['warning'], 'bad': C['danger']}
+        for i, r in enumerate(rows, 1):
+            for j, v in enumerate(r[:4]):
+                lbl(est_tbl, v, fg=tones[r[4]] if j == 3 else C['text'], font=F['monos'], bg=C['card2']).grid(row=i, column=j, sticky='w', padx=(0, 28))
+        lbl(est_tbl, foot, fg=C['muted'], font=F['small'], bg=C['card2']).grid(row=len(rows) + 1, column=0, columnspan=4, sticky='w', pady=(8, 0))
 
     def dumb_changed():
         on = V['dumb'].get()
@@ -1131,7 +1021,7 @@ def run_gui():
     kill_btn = Btn(ctl, 'Force stop', lambda: kill_run(), 'danger')
     kill_btn.pack(side='left', padx=(8, 0))
     Btn(ctl, 'Copy command', lambda: (root.clipboard_clear(), root.clipboard_append(cmd_box.get('1.0', 'end').strip())), 'ghost', small=True).pack(side='right')
-    Btn(ctl, 'Open output folder', lambda: open_path(snapshot().get('out')), 'ghost', small=True).pack(side='right', padx=(0, 8))
+    Btn(ctl, 'Open output folder', lambda: open_path_(snapshot().get('out')), 'ghost', small=True).pack(side='right', padx=(0, 8))
     stop_btn.set_enabled(False)
     kill_btn.set_enabled(False)
 
@@ -1182,7 +1072,7 @@ def run_gui():
     rcb.pack(fill='both', expand=True, padx=20, pady=16)
     lbl(rcb, 'This machine', fg=C['bright'], font=F['h']).pack(anchor='w', pady=(0, 6))
     meters = {}
-    for key, title in (('cpu', 'CPU'), ('ram', 'Memory'), ('temp', 'CPU temperature'), ('disk', 'Free disk (output)'), ('battery', 'Battery')):
+    for key, title in METERS:
         f = tk.Frame(rcb, bg=C['card'])
         f.pack(fill='x', pady=(3, 0))
         lbl(f, title, fg=C['muted'], font=F['small']).pack(side='left')
@@ -1351,21 +1241,10 @@ def run_gui():
              'rates': [], 'verdict': None, 'counts': {}, 'gate_when': None}
     res_mon = Resources()
 
-    def open_path(p):
-        if not p:
-            return
-        if not os.path.exists(p):
-            message('Not there yet', 'The folder does not exist yet:\n%s' % p)
-            return
-        try:
-            if WINDOWS:
-                os.startfile(p)
-            elif MACOS:
-                subprocess.Popen(['open', p])
-            else:
-                subprocess.Popen(['xdg-open', p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as ex:
-            message('Could not open', str(ex))
+    def open_path_(p):
+        err = open_path(p)
+        if err:
+            message('Could not open', err)
 
     def engine():
         return Engine(V['engine'].get().strip(), V['python'].get().strip())
@@ -1389,18 +1268,11 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start()
 
     def engine_result(rc, out):
-        first = out.strip().splitlines()[-1] if out.strip() else ''
-        if rc == 0 and 'unmicro' in out:
-            ver = first.split()[-1]
-            set_engine_chip('unmicro %s' % ver, C['success'])
-            eng_out.configure(text='Ready: %s' % first, fg=C['success'])
+        ok, chip_text, detail, ver = engine_verdict(rc, out)
+        set_engine_chip(chip_text, C['success'] if ok else C['danger'])
+        eng_out.configure(text=detail, fg=C['success'] if ok else C['danger'])
+        if ver:
             cfg['engine_version'] = ver
-        else:
-            set_engine_chip('not working', C['danger'])
-            hint = ''
-            if 'GLIBC' in out:
-                hint = '\nThis Linux build needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+). On an older system choose unmicro.py instead (needs Python 3; pip install pycryptodome makes it fast).'
-            eng_out.configure(text='The engine did not start: %s%s' % (out.strip()[-400:], hint), fg=C['danger'])
 
     def lic_env():
         return {LICENSE_ENV: V['license'].get().strip()}
@@ -1420,11 +1292,10 @@ def run_gui():
 
     def license_result(rc, out):
         check_btn.set_enabled(True)
-        lines = [ln for ln in out.splitlines() if ln.strip()]
-        if rc == 0 and lines:
-            keys = lines
-            cfg['keydata'] = {'keys': keys, 'alphabets': alphabet_sizes(keys), 'max_len': max(len(k) for k in keys),
-                              'version': cfg.get('engine_version')}
+        kd = keydata_from_list(out, cfg.get('engine_version')) if rc == 0 else None
+        if kd:
+            cfg['keydata'] = kd
+            keys = kd['keys']
             lic_status.configure(text='Licence OK. This build knows %d recovered keys (longest %d characters).' % (len(keys), cfg['keydata']['max_len']), fg=C['success'])
             set_license_chip('OK \u00b7 %d keys' % len(keys), C['success'])
             if V['dumb'].get():
@@ -1451,37 +1322,6 @@ def run_gui():
             t.pack(fill='both', expand=True)
         dialog('%s (exit code %s)' % (title, rc), body, [('Close', True, 'primary')], danger=rc != 0, width=760)
 
-    def summary(s):
-        out = []
-        if s['source'] == 'auto':
-            out.append(('Files', 'Search the whole computer' + (' plus %d extra place(s)' % len(s['scan_roots']) if s['scan_roots'] else '') + (', system folders included' if s['no_prune'] else '')))
-        elif s['source'] == 'list':
-            out.append(('Files', 'The files listed in %s' % (s['file_list'] or '(not chosen)')))
-        else:
-            n = len(s['paths'])
-            out.append(('Files', ('%d place(s): %s' % (n, '; '.join(s['paths'][:3]) + (' \u2026' if n > 3 else ''))) if n else '(nothing chosen)'))
-        k = []
-        if s['keys']:
-            k.append('%d key(s) you typed' % len(s['keys']))
-        if s['wordlist']:
-            k.append('a wordlist')
-        if s['scavenge']:
-            k.append('%d dump(s)' % len(s['scavenge']))
-        k.append('the recovered operator keys')
-        out.append(('Keys', ', '.join(k)))
-        lv = {'quick': 'Quick', 'standard': 'Standard (likely variations)', 'deep': 'Deep (widened variations)'}[s['level']]
-        if s['dumb']:
-            mode = {'ask': 'asking before long lengths', 'keepgoing': 'every length without asking', 'endless': 'UNTIL THE MACHINE CANNOT TAKE IT'}[s['dumb_mode']]
-            lv += '; then every possible key, %s alphabet, %s' % (s['charset'], mode)
-        out.append(('Search', lv))
-        out.append(('Machine', '%s%s%s' % ('all %d cores' % cpu_n if not s['workers'] else '%d of %d cores' % (s['workers'], cpu_n),
-                                           ', GPU' if s['gpu'] else '', (', stop after %s guesses' % s['max_candidates']) if s['max_candidates'] and not (s['dumb'] and s['dumb_mode'] == 'endless') else '')))
-        if s['identify']:
-            out.append(('Output', 'Key check only: nothing is written'))
-        else:
-            out.append(('Output', '%s%s%s' % (s['out'] or '(not chosen)', ', one folder' if s['flat'] else '', {'normal': '', 'strict': ', strict checking', 'keep': ', keep unverified files'}[s['verify']])))
-        return out
-
     def refresh_review(*_):
         if not ready['v']:
             return
@@ -1491,18 +1331,16 @@ def run_gui():
             return
         for wdg in review_lines.winfo_children():
             wdg.destroy()
-        for i, (k, v) in enumerate(summary(s)):
+        for i, (k, v) in enumerate(summary(s, cpu_n)):
             lbl(review_lines, k, fg=C['muted'], font=F['small']).grid(row=i, column=0, sticky='nw', padx=(0, 18), pady=2)
             lbl(review_lines, v, fg=C['danger'] if 'CANNOT' in v else C['bright'], wraplength=900).grid(row=i, column=1, sticky='w', pady=2)
         probs = problems(s)
         for j, p in enumerate(probs):
             lbl(review_lines, '!  ' + p, fg=C['warning'], font=F['small']).grid(row=20 + j, column=0, columnspan=2, sticky='w', pady=(4 if j == 0 else 0, 0))
         e = engine()
-        args = build_args(s, '<file list>' if s['source'] == 'folders' and len(s['paths']) > 1 else None)
-        env_hint = ('set %s=\u2026 && ' % LICENSE_ENV) if WINDOWS else ('%s=\u2026 ' % LICENSE_ENV)
         cmd_box.configure(state='normal')
         cmd_box.delete('1.0', 'end')
-        cmd_box.insert('1.0', env_hint + ' '.join(quote_arg(x) for x in e.argv(args)))
+        cmd_box.insert('1.0', command_preview(e, s))
         cmd_box.configure(state='disabled')
         if not (state['job'] and state['job'].running()):
             start_btn.set_enabled(not probs and bool(e.path))
@@ -1536,13 +1374,10 @@ def run_gui():
         flp = None
         if s['source'] == 'folders' and len(s['paths']) > 1:
             gui_note('collecting the files from %d places into a file list\u2026' % len(s['paths']))
-            items = [p for p, _ in find_encrypted(s['paths'], s['recursive'])]
-            if not items:
+            flp = write_file_list(s['paths'], s['recursive'])
+            if not flp:
                 message('No encrypted files', 'No .cryptedmicro files were found in the places you chose.')
                 return
-            fd, flp = tempfile.mkstemp(prefix='unmicro-files-', suffix='.txt')
-            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-                fh.write('\n'.join(items) + '\n')
             state['file_list_tmp'] = flp
         args = build_args(s, flp)
         argv = e.argv(args)
@@ -1597,13 +1432,9 @@ def run_gui():
         root.after(100, pump)
 
     def feed(tag, text):
-        buf = state['buf'][tag] + text
-        parts = re.split(r'(\r\n|\n|\r)', buf)
-        # parts: text, sep, text, sep, ..., tail
-        for i in range(0, len(parts) - 1, 2):
-            line, sep = parts[i], parts[i + 1]
+        lines, state['buf'][tag] = split_lines(state['buf'][tag] + text)
+        for line, sep in lines:
             handle_line(tag, line, sep)
-        state['buf'][tag] = parts[-1]
 
     def handle_line(tag, line, sep):
         kind, d = parse_line(line)
@@ -1652,18 +1483,11 @@ def run_gui():
         name = d['name']
         tile('tried', fmt_count(d['tried']), name[:30])
         tile('rate', '%s/s' % fmt_count(d['rate']), '%d worker(s)%s' % (state['workers_used'], ' + GPU' if state['gpu_used'] else ''))
-        m = RE_BRUTE_LEN.search(name)
-        if m:
-            L = int(m.group(1))
-            alpha, maxlen = alpha_and_max(state.get('charset', 'turkish'))
-            size = alpha ** L
-            done = max(0, d['tried'] - state['tier_start'])
-            frac = min(1.0, done / float(size))
-            len_bar.configure(value=frac * 1000)
-            left = (size - done) / d['rate'] if d['rate'] > 0 else None
-            method_l.configure(text='Every possible key of %d characters (of up to %d)' % (L, maxlen))
-            len_l.configure(text='%s of %s keys of this length (%.2f%%), about %s left for this length' % (
-                fmt_count(done), '{:.3g}'.format(size) if size > 1e12 else fmt_count(size), frac * 100, fmt_duration(left)))
+        lp = length_progress(name, d['tried'], state['tier_start'], d['rate'], *alpha_and_max(cfg, state.get('charset', 'turkish')))
+        if lp:
+            len_bar.configure(value=lp['frac'] * 1000)
+            method_l.configure(text=lp['method'])
+            len_l.configure(text=lp['detail'])
         else:
             method_l.configure(text=('GCM: ' if d['gcm'] else '') + name)
             len_bar.configure(value=0)
@@ -1674,7 +1498,9 @@ def run_gui():
         tail = state['buf']['out']
         if not tail or job is None:
             return
-        if tail.endswith(PROMPT_PAUSE):
+        pr = classify_prompt(tail)
+        kind = pr[0] if pr else None
+        if kind == 'pause':
             log_write(tail)
             state['buf']['out'] = ''
             choice = '2'
@@ -1686,10 +1512,10 @@ def run_gui():
             job.send(choice + '\n')
             if choice == '1':
                 state['pending_stop'] = False
-        elif RE_GATE.search(tail):
+        elif kind == 'gate':
             log_write(tail)
             state['buf']['out'] = ''
-            L = int(RE_GATE.search(tail).group(1))
+            L = pr[1]
             when = state.get('gate_when') or 'a long time'
             yes = dialog('Keep going into %d-character keys?' % L,
                          lambda f, s: lbl(f, 'Every shorter key has been tried with no match. Keys of exactly %d characters would take roughly %s on this machine, and each length after it is far longer.\n\nYou can stop here and recover nothing new, or keep going (progress is saved if "Save progress" is on).' % (L, when),
@@ -1697,10 +1523,10 @@ def run_gui():
                          [('Stop here', False, 'ghost'), ('Keep going', True, 'primary')])
             gui_note('length %d: %s' % (L, 'keep going' if yes else 'stop here'))
             job.send('y\n' if yes else 'n\n')
-        elif tail.rstrip().endswith(PROMPT_CLOSE):
+        elif kind == 'close':
             state['buf']['out'] = ''
             job.send('\n')
-        elif tail.endswith(PROMPT_LICENSE):
+        elif kind == 'license':
             state['buf']['out'] = ''
             gui_note('unmicro asked for a licence key: it did not get one. Stopping.')
             job.kill()
@@ -1722,52 +1548,25 @@ def run_gui():
     def monitor():
         s = res_mon.sample(state.get('out'))
         lims = {k: v.get() for k, v in LIM.items()}
-
-        def meter(key, value, text, frac, bad, warn):
+        styles = {'bad': 'Bad.Horizontal.TProgressbar', 'warn': 'Warn.Horizontal.TProgressbar'}
+        for key, (text, frac, tone) in meter_readings(s, lims).items():
             vl, pb = meters[key]
-            vl.configure(text=text, fg=C['danger'] if bad else (C['warning'] if warn else C['text']))
-            pb.configure(value=max(0, min(100, frac)),
-                         style='Bad.Horizontal.TProgressbar' if bad else ('Warn.Horizontal.TProgressbar' if warn else 'Horizontal.TProgressbar'))
-        if s['cpu'] is not None:
-            meter('cpu', s['cpu'], '%.0f%%' % s['cpu'], s['cpu'], False, False)
-        if s['ram'] is not None:
-            meter('ram', s['ram'], '%.0f%%' % s['ram'], s['ram'], s['ram'] >= lims['max_ram'], s['ram'] >= lims['max_ram'] - 8)
-        if s['temp'] is not None:
-            meter('temp', s['temp'], '%.0f\u00b0C' % s['temp'], s['temp'] / lims['max_temp'] * 100, s['temp'] >= lims['max_temp'], s['temp'] >= lims['max_temp'] - 10)
-        if s['disk_free_gb'] is not None:
-            meter('disk', s['disk_free_gb'], '%.1f GB' % s['disk_free_gb'], min(100, s['disk_free_gb'] / max(lims['min_disk_gb'] * 10, 1) * 100),
-                  s['disk_free_gb'] <= lims['min_disk_gb'], s['disk_free_gb'] <= lims['min_disk_gb'] * 2)
-        if s['battery'] is not None:
-            meter('battery', s['battery'], '%.0f%%%s' % (s['battery'], ' on battery' if s['on_battery'] else ' plugged in'), s['battery'],
-                  s['on_battery'] and s['battery'] <= lims['min_battery'], s['on_battery'] and s['battery'] <= lims['min_battery'] + 10)
+            vl.configure(text=text, fg={'bad': C['danger'], 'warn': C['warning']}.get(tone, C['text']))
+            pb.configure(value=frac, style=styles.get(tone, 'Horizontal.TProgressbar'))
         if not state['endless']:
             ttf_l.configure(text='')
             ttf_sub.configure(text='')
             return
         # time to failure
-        alpha, maxlen = alpha_and_max(state.get('charset', 'turkish'))
-        rate = (sum(state['rates'][-10:]) / len(state['rates'][-10:])) if state['rates'] else estimate_rate(cfg, state['workers_used'], state['gpu_used'])
-        sched = brute_schedule(alpha, maxlen, rate)
-        m = RE_BRUTE_LEN.search(state['tier'] or '')
-        if m:
-            L = int(m.group(1))
-            done = max(0, state['tried'] - state['tier_start'])
-            left = sum(r[1] for r in sched if r[0] > L) + max(0, alpha ** L - done)
-            search_secs = left / max(rate, 1)
-        else:
-            search_secs = sched[-1][3]
-        secs, why, details = time_to_failure(search_secs, s, lims, res_mon.slopes())
-        ttf_l.configure(text='Time to failure: about %s (%s)' % (fmt_duration(secs), why.lower()))
-        ttf_sub.configure(text='  \u00b7  '.join('%s: %s' % (lbl_, fmt_duration(v) if v is not None else 'measuring') for lbl_, v, _ in details))
+        alpha, maxlen = alpha_and_max(cfg, state.get('charset', 'turkish'))
+        rate = live_rate(state['rates'], cfg, state['workers_used'], state['gpu_used'])
+        search_secs = search_left_secs(alpha, maxlen, rate, state['tier'], state['tried'], state['tier_start'])
+        head, sub = ttf_text(*time_to_failure(search_secs, s, lims, res_mon.slopes()))
+        ttf_l.configure(text=head)
+        ttf_sub.configure(text=sub)
         # safety limits
         tripped = limits_tripped(s, lims)
-        hits = state['limit_hits']
-        for k in tripped:
-            hits[k] = hits.get(k, 0) + 1
-        for k in list(hits):
-            if k not in tripped:
-                hits.pop(k)
-        if any(v >= 6 for v in hits.values()) and not state['pending_stop']:
+        if count_limit_hits(state['limit_hits'], tripped) and not state['pending_stop']:
             why = ', '.join(tripped.values())
             state['stop_reason'] = 'safety limit: ' + why
             gui_note('SAFETY LIMIT HIT (%s) for 30 seconds: stopping and recovering the matched files.' % why)
@@ -1807,11 +1606,7 @@ def run_gui():
         el = time.time() - state['t0']
         gui_note('unmicro exited with code %s after %s' % (rc, fmt_duration(el)))
         # remember the measured speed for future estimates
-        if state['rates'] and not state['gpu_used']:
-            r = sorted(state['rates'])[len(state['rates']) // 2]
-            cfg.setdefault('measured', {})['per_worker'] = r / max(1, state['workers_used'])
-        elif state['rates'] and state['gpu_used']:
-            cfg.setdefault('measured', {})['gpu_rate'] = sorted(state['rates'])[len(state['rates']) // 2]
+        record_speed(cfg, state['rates'], state['workers_used'], state['gpu_used'])
         if state['file_list_tmp']:
             try:
                 os.unlink(state['file_list_tmp'])
@@ -1836,14 +1631,9 @@ def run_gui():
         refresh_review()
 
     def endless_warning(s):
-        alpha, maxlen = alpha_and_max(s['charset'])
-        workers = s['workers'] or cpu_n
-        rate = estimate_rate(cfg, workers, s['gpu'])
-        sched = brute_schedule(alpha, maxlen, rate)
-        res = res_mon.sample(s.get('out'))
         lims = {k: v.get() for k, v in LIM.items()}
-        secs, why, details = time_to_failure(sched[-1][3], res, lims, {})
-        measured = bool((cfg.get('measured') or {}).get('per_worker'))
+        E = endless_estimate(cfg, s, cpu_n, res_mon.sample(s.get('out')), lims)
+        maxlen, workers, rate, secs, why, details, measured = E['maxlen'], E['workers'], E['rate'], E['secs'], E['why'], E['details'], E['measured']
 
         def body(f, set_state):
             lbl(f, 'This search does not end by itself.', fg=C['bright'], font=F['bold']).pack(anchor='w')
@@ -1854,18 +1644,18 @@ def run_gui():
             box = tk.Frame(f, bg=C['card2'], highlightthickness=1, highlightbackground=C['danger'])
             box.pack(fill='x')
             lbl(box, 'Estimated time to failure:  %s' % fmt_duration(secs), fg=C['danger'], font=F['big'], bg=C['card2']).pack(anchor='w', padx=14, pady=(10, 0))
-            lbl(box, 'Limited by: %s' % why.lower(), fg=C['text'], bg=C['card2']).pack(anchor='w', padx=14)
+            lbl(box, 'Limited by: %s' % phrase(why), fg=C['text'], bg=C['card2']).pack(anchor='w', padx=14)
             for name, v, note in details:
                 lbl(box, '\u2022 %s: %s  (%s)' % (name, fmt_duration(v) if v is not None else 'measured once running', note), fg=C['muted'], font=F['small'], bg=C['card2']).pack(anchor='w', padx=14)
             lbl(box, 'In practice: every key up to %d characters is tried within a day, up to %d within a week, up to %d within a year.' % (
-                reachable_length(sched, 86400), reachable_length(sched, 7 * 86400), reachable_length(sched, 365.25 * 86400)),
+                E['day'], E['week'], E['year']),
                 fg=C['text'], font=F['small'], bg=C['card2'], wraplength=620).pack(anchor='w', padx=14, pady=(6, 0))
             lbl(box, 'Speed assumed: %s keys/s %s.' % (
                 fmt_count(rate), '(measured on this machine)' if measured else '(rough guess; the live figure replaces it once running)'),
                 fg=C['faint'], font=F['tiny'], bg=C['card2'], wraplength=620).pack(anchor='w', padx=14, pady=(2, 10))
             lbl(f, 'Safety limits (Settings tab) stop it cleanly and recover every matched file: CPU over %d\u00b0C, memory over %d%%, under %d GB free disk, battery under %d%%. %s' % (
                        lims['max_temp'], lims['max_ram'], lims['min_disk_gb'], lims['min_battery'],
-                       ('CPU temperature now: %.0f\u00b0C; the time to failure is refined from its trend once running.' % res['temp']) if res.get('temp') is not None
+                       ('CPU temperature now: %.0f\u00b0C; the time to failure is refined from its trend once running.' % E['temp']) if E['temp'] is not None
                        else 'This machine gives no temperature reading, so overheating is left to the hardware\'s own protection.'),
                 fg=C['muted'], font=F['small'], wraplength=640).pack(anchor='w', pady=(12, 8))
             ack = tk.BooleanVar(value=False)
