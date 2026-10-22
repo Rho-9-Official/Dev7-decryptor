@@ -4,16 +4,18 @@ Run from the repository root:
 
     python -m unittest discover -s tests -v
 
-The tests that drive an OpenCL device need pyopencl and a device, and are
-skipped without them. --gpu only takes GPUs, so on a machine with only an
-OpenCL CPU runtime (pocl) set UNMICRO_OPENCL_DEVICE to part of its name,
-for example UNMICRO_OPENCL_DEVICE=portable. The stand-in tests need neither
-and always run.
+The tests that drive an OpenCL device need one (any NVIDIA or AMD graphics
+driver provides OpenCL; no Python package is needed), and are skipped
+without it. --gpu only takes GPUs, so on a machine with only an OpenCL CPU
+runtime (pocl) set UNMICRO_OPENCL_DEVICE to part of its name, for example
+UNMICRO_OPENCL_DEVICE=portable. The stand-in tests need no device and
+always run.
 """
 import hashlib
 import os
 import sys
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -24,10 +26,9 @@ from test_edge_cases import Base, KEY, jpeg, junk, make_gcm, supplied  # noqa: E
 _DEVICE = None
 _WHY = 'no OpenCL device'
 try:
-    import pyopencl  # noqa: F401
     _DEVICE = unmicro.GpuPBKDF2()
-except Exception as e:  # no pyopencl, no runtime, or no device
-    _WHY = 'needs pyopencl and an OpenCL device (%s)' % e
+except Exception as e:  # no OpenCL library, or no device
+    _WHY = 'needs an OpenCL device (%s)' % e
 
 
 class _WrongGpu(object):
@@ -185,9 +186,67 @@ class OnDevice(Base):
             self.assertEqual(unmicro._KDF_CACHE[(KEY, salt)], unmicro.gcm_kdf(KEY, salt))
 
     def test_init_reports_ready(self):
-        if not (_DEVICE.device.type & pyopencl.device_type.GPU) and not os.environ.get('UNMICRO_OPENCL_DEVICE'):
+        if _DEVICE.device.kind_name() != 'GPU' and not os.environ.get('UNMICRO_OPENCL_DEVICE'):
             self.skipTest('init_gpu_gcm only takes GPUs unless UNMICRO_OPENCL_DEVICE is set')
         self.assertIsNotNone(unmicro.init_gpu_gcm(quiet=True))
+
+
+class NoOpenCL(unittest.TestCase):
+    """A machine with no OpenCL library: --gpu says so and uses the CPU."""
+
+    def test_both_paths_fall_back(self):
+        with mock.patch.object(unmicro, '_cl_library_names', return_value=[os.path.join(HERE, 'no-such-OpenCL-library')]), \
+                mock.patch('ctypes.util.find_library', return_value=None):
+            self.assertIsNone(unmicro.init_gpu(quiet=True))
+            self.assertIsNone(unmicro.init_gpu_gcm(quiet=True))
+            with self.assertRaises(RuntimeError):
+                unmicro.OpenCL()
+
+
+_AES = None
+if _DEVICE is not None:
+    try:
+        _AES = unmicro.GpuAES()
+    except Exception as e:
+        _WHY = 'needs an OpenCL device (%s)' % e
+
+
+@unittest.skipIf(_AES is None, _WHY)
+class OlderFormatOnDevice(unittest.TestCase):
+    """The AES path for the older files, now on the same OpenCL layer."""
+
+    @classmethod
+    def setUpClass(cls):
+        unmicro._init_backend(False)
+
+    def test_selftests_pass(self):
+        self.assertTrue(_AES.selftest())
+        _AES.set_alphabet(list('abcdefghijklmnopqrstuvwxyz0123456789'))
+        self.assertTrue(_AES.mask_selftest(length=3))
+
+    def test_filter_matches_cpu(self):
+        # Candidates whose decrypt of the probe block starts with a signature
+        # are kept, and only those: compared with the CPU over 20,000 keys.
+        block = os.urandom(16)
+        cands = ['c%d' % i for i in range(20000)]
+        got = _AES.filter_chunk(cands, [(block, None)])
+        want = [c for c in cands if unmicro._cpu_magic_hit(unmicro._dec_blocks(unmicro.key_bytes(c), block), _AES._magics)]
+        self.assertEqual(got, want)
+
+    def test_filter_finds_a_real_key(self):
+        if _gcm_seal_ecb is None:
+            self.skipTest('needs cryptography or pycryptodome')
+        key = 'real-key-1'
+        off, magic = next((o, m) for o, m in _AES._magics if o == 0 and len(m) >= 4)
+        block = _gcm_seal_ecb(unmicro.key_bytes(key), magic + os.urandom(16 - len(magic)))
+        got = _AES.filter_chunk(['x1', key, 'x2'], [(block, None)])
+        self.assertIn(key, got)
+
+
+try:
+    from test_edge_cases import _ecb_seal as _gcm_seal_ecb
+except ImportError:
+    _gcm_seal_ecb = None
 
 
 if __name__ == '__main__':

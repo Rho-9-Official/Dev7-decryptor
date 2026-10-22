@@ -17,7 +17,5 @@ filetype>=1.2.0
 # "cryptography" if that is what you have installed instead.
 pycryptodome>=3.19.0
 
-# Optional GPU acceleration for the sweep (--gpu), OpenCL, covers NVIDIA and
-# AMD. Needs a working OpenCL runtime for your GPU as well. Uncomment to use:
-# pyopencl>=2023.1
-# numpy>=1.21
+# GPU acceleration (--gpu) needs no package: unmicro calls the OpenCL library
+# that the NVIDIA or AMD graphics driver installs, through ctypes.

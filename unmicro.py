@@ -9,6 +9,7 @@ import itertools
 import os
 import re
 import string
+import struct
 import sys
 import time
 try:
@@ -25,7 +26,7 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '5.1.0'
+VERSION = '5.1.1'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
 # Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the
@@ -2970,7 +2971,31 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
 def _gpu_kernel_source():
     sbox = ','.join((str(b) for b in _SBOX))
     isbox = ','.join((str(b) for b in _INV_SBOX))
-    return _GPU_KERNEL_TEMPLATE.replace('KERNEL_INVSBOX_DATA', isbox).replace('KERNEL_SBOX_DATA', sbox)
+    return _GPU_KERNEL_TEMPLATE.replace('KERNEL_INVSBOX_DATA', isbox).replace('KERNEL_SBOX_DATA', sbox) + _GPU_MAGIC_KERNEL
+# Batch decrypt with the signature match on the device: one byte per
+# supplied key, 1 where its plaintext block starts like a known file type.
+# filter_chunk uses it, so only those flags cross the bus.
+_GPU_MAGIC_KERNEL = r'''
+__kernel void aes256_ecb_magic(__global const uchar* keys, __global const uchar* ct,
+                               __global const uchar* mbytes, __global const uint* moff,
+                               __global const uchar* mat, __global const uchar* mlen, const uint M,
+                               __global uchar* flags, const uint n){
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    uchar key[32], c[16], pt[16];
+    for(int i=0;i<32;i++) key[i] = keys[(ulong)gid*32 + i];
+    for(int i=0;i<16;i++) c[i] = ct[i];
+    aes256_decrypt(key, c, pt);
+    uchar hit = 0;
+    for(uint m=0;m<M && !hit;m++){
+        uint at=mat[m], ln=mlen[m], mo=moff[m];
+        bool ok = true;
+        for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }
+        if(ok) hit = 1;
+    }
+    flags[gid] = hit;
+}
+'''
 _GPU_KERNEL_TEMPLATE = '\n__constant uchar SBOX[256]  = {KERNEL_SBOX_DATA};\n__constant uchar ISBOX[256] = {KERNEL_INVSBOX_DATA};\n__constant uchar RCON[8]    = {0,1,2,4,8,16,32,64};\n\ninline uchar gmul(uchar a, uchar b){\n    uchar p = 0;\n    for(int i=0;i<8;i++){\n        if(b & 1) p ^= a;\n        uchar hi = a & 0x80;\n        a <<= 1;\n        if(hi) a ^= 0x1b;\n        b >>= 1;\n    }\n    return p;\n}\n\n/* AES-256-ECB single block decrypt. All args private. This is the one place\n   the cipher lives; both kernels below call it. */\nvoid aes256_decrypt(const uchar* key, const uchar* ct, uchar* out){\n    uchar rk[240];\n    for(int i=0;i<32;i++) rk[i] = key[i];\n    int rconi = 1;\n    for(int i=8;i<60;i++){\n        uchar t0=rk[(i-1)*4+0], t1=rk[(i-1)*4+1], t2=rk[(i-1)*4+2], t3=rk[(i-1)*4+3];\n        if(i%8==0){\n            uchar tmp=t0;\n            t0 = SBOX[t1] ^ RCON[rconi]; t1 = SBOX[t2]; t2 = SBOX[t3]; t3 = SBOX[tmp];\n            rconi++;\n        } else if(i%8==4){\n            t0=SBOX[t0]; t1=SBOX[t1]; t2=SBOX[t2]; t3=SBOX[t3];\n        }\n        rk[i*4+0]=rk[(i-8)*4+0]^t0; rk[i*4+1]=rk[(i-8)*4+1]^t1;\n        rk[i*4+2]=rk[(i-8)*4+2]^t2; rk[i*4+3]=rk[(i-8)*4+3]^t3;\n    }\n    uchar s[16], t[16];\n    for(int i=0;i<16;i++) s[i] = ct[i] ^ rk[14*16 + i];\n    for(int round=13; round>=1; round--){\n        for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];\n        for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];\n        for(int i=0;i<16;i++) t[i] ^= rk[round*16 + i];\n        for(int c=0;c<4;c++){\n            uchar a0=t[4*c+0],a1=t[4*c+1],a2=t[4*c+2],a3=t[4*c+3];\n            s[4*c+0]=gmul(a0,14)^gmul(a1,11)^gmul(a2,13)^gmul(a3,9);\n            s[4*c+1]=gmul(a0,9)^gmul(a1,14)^gmul(a2,11)^gmul(a3,13);\n            s[4*c+2]=gmul(a0,13)^gmul(a1,9)^gmul(a2,14)^gmul(a3,11);\n            s[4*c+3]=gmul(a0,11)^gmul(a1,13)^gmul(a2,9)^gmul(a3,14);\n        }\n    }\n    for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];\n    for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];\n    for(int i=0;i<16;i++) out[i] = t[i] ^ rk[0*16 + i];\n}\n\n/* Batch decrypt: one supplied 32-byte key per work-item. Used by filter_chunk\n   and by the AES self-test. */\n__kernel void aes256_ecb_decrypt(__global const uchar* keys,\n                                 __global const uchar* ct,\n                                 __global uchar* out,\n                                 const uint n){\n    uint gid = get_global_id(0);\n    if(gid >= n) return;\n    uchar key[32], c[16], o[16];\n    for(int i=0;i<32;i++) key[i] = keys[(uint)gid*32 + i];\n    for(int i=0;i<16;i++) c[i] = ct[i];\n    aes256_decrypt(key, c, o);\n    for(int i=0;i<16;i++) out[(uint)gid*16 + i] = o[i];\n}\n\n/* On-device structural brute. Each work-item turns its own index into a\n   candidate over the alphabet, builds the key, decrypts, and checks the magic\n   table, writing only the indices that hit. No candidate ever crosses the bus,\n   which is what lets this run at GPU speed instead of at Python speed.\n\n   idx = start + gid, decomposed mixed-radix over the alphabet (position 0 of\n   the string is most significant). Each character contributes its UTF-8 bytes,\n   packed into the 32-byte key exactly as key_bytes() does on the host. */\n__kernel void aes256_brute_mask(\n        __global const uchar* alpha,  __global const uint*  aoff,\n        __global const uchar* alen,   const uint N, const uint L,\n        const ulong start, const uint count,\n        __global const uchar* ct,\n        __global const uchar* mbytes, __global const uint* moff,\n        __global const uchar* mat,    __global const uchar* mlen, const uint M,\n        __global uint* out_idx, volatile __global uint* out_cnt, const uint out_cap){\n    uint gid = get_global_id(0);\n    if(gid >= count) return;\n    ulong idx = start + (ulong)gid;\n\n    uchar d[32];\n    ulong rem = idx;\n    for(uint p=0;p<L;p++){ d[p] = (uchar)(rem % (ulong)N); rem /= (ulong)N; }\n\n    uchar key[32];\n    for(int i=0;i<32;i++) key[i] = 0;\n    uint kb = 0;\n    for(uint s=0;s<L;s++){\n        uint ci = d[L-1-s];\n        uint off = aoff[ci];\n        uint ln  = alen[ci];\n        for(uint b=0;b<ln;b++){ if(kb<32){ key[kb] = alpha[off+b]; kb++; } }\n    }\n\n    uchar c[16]; for(int i=0;i<16;i++) c[i] = ct[i];\n    uchar pt[16]; aes256_decrypt(key, c, pt);\n\n    for(uint m=0;m<M;m++){\n        uint at=mat[m], ln=mlen[m], mo=moff[m];\n        bool ok = true;\n        for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }\n        if(ok){\n            uint slot = atomic_inc(out_cnt);\n            if(slot < out_cap) out_idx[slot] = gid;\n            return;\n        }\n    }\n}\n'
 _GPU_MIN_MAGIC = 3
 
@@ -2983,112 +3008,400 @@ def _decode_index(idx, alphabet, length):
         rem //= n
     return ''.join((alphabet[d[length - 1 - s]] for s in range(length)))
 
+# ----------------------------------------------------------------------
+# OpenCL through ctypes
+# ----------------------------------------------------------------------
+#
+# --gpu calls the OpenCL library that the graphics driver installs
+# (OpenCL.dll on Windows, libOpenCL.so.1 on Linux) straight through ctypes,
+# so it needs no Python package and works from the downloads as well as
+# from source. Only the calls the two GPU paths use are wrapped.
+_CL_PLATFORM_NAME = 0x0902
+_CL_PLATFORM_VENDOR = 0x0903
+_CL_DEVICE_TYPE = 0x1000
+_CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002
+_CL_DEVICE_NAME = 0x102B
+_CL_DEVICE_TYPE_CPU = 1 << 1
+_CL_DEVICE_TYPE_GPU = 1 << 2
+_CL_DEVICE_TYPE_ALL = 0xFFFFFFFF
+_CL_MEM_READ_WRITE = 1 << 0
+_CL_MEM_READ_ONLY = 1 << 2
+_CL_MEM_COPY_HOST_PTR = 1 << 5
+_CL_PROGRAM_BUILD_LOG = 0x1183
+_CL_DEVICE_NOT_FOUND = -1
+
+def _cl_library_names():
+    names = []
+    env = os.environ.get('UNMICRO_OPENCL_LIB', '').strip()
+    if env:
+        names.append(env)
+    if os.name == 'nt':
+        names.append('OpenCL.dll')
+    elif sys.platform == 'darwin':
+        names.append('/System/Library/Frameworks/OpenCL.framework/OpenCL')
+    else:
+        names += ['libOpenCL.so.1', 'libOpenCL.so']
+    return names
+
+class OpenCL(object):
+    """The driver's OpenCL library. Raises RuntimeError when there is none."""
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        self.ct = ct = ctypes
+        names = _cl_library_names()
+        found = ctypes.util.find_library('OpenCL')
+        if found and found not in names:
+            names.append(found)
+        loader = ctypes.WinDLL if os.name == 'nt' else ctypes.CDLL
+        lib = None
+        for name in names:
+            try:
+                lib = loader(name)
+                break
+            except OSError:
+                continue
+        if lib is None:
+            raise RuntimeError('no OpenCL library found; it comes with the NVIDIA or AMD graphics driver')
+        self.lib = lib
+        P, U, I, S, Q = (ct.c_void_p, ct.c_uint32, ct.c_int32, ct.c_size_t, ct.c_uint64)
+        PI = ct.POINTER(I)
+        sigs = {
+            'clGetPlatformIDs': (I, [U, P, P]),
+            'clGetPlatformInfo': (I, [P, U, S, P, P]),
+            'clGetDeviceIDs': (I, [P, Q, U, P, P]),
+            'clGetDeviceInfo': (I, [P, U, S, P, P]),
+            'clCreateContext': (P, [P, U, P, P, P, PI]),
+            'clCreateCommandQueue': (P, [P, P, Q, PI]),
+            'clCreateProgramWithSource': (P, [P, U, P, P, PI]),
+            'clBuildProgram': (I, [P, U, P, ct.c_char_p, P, P]),
+            'clGetProgramBuildInfo': (I, [P, P, U, S, P, P]),
+            'clCreateKernel': (P, [P, ct.c_char_p, PI]),
+            'clSetKernelArg': (I, [P, U, S, P]),
+            'clCreateBuffer': (P, [P, Q, S, P, PI]),
+            'clEnqueueNDRangeKernel': (I, [P, P, U, P, P, P, U, P, P]),
+            'clEnqueueReadBuffer': (I, [P, P, U, S, S, P, U, P, P]),
+            'clFinish': (I, [P]),
+            'clReleaseMemObject': (I, [P]),
+            'clReleaseKernel': (I, [P]),
+            'clReleaseProgram': (I, [P]),
+            'clReleaseCommandQueue': (I, [P]),
+            'clReleaseContext': (I, [P]),
+        }
+        for fname, (res, args) in sigs.items():
+            fn = getattr(lib, fname)
+            fn.restype = res
+            fn.argtypes = args
+
+    def check(self, code, what):
+        if code != 0:
+            raise RuntimeError('OpenCL error %d in %s' % (code, what))
+
+    def _info_str(self, fn, handle, param):
+        ct = self.ct
+        size = ct.c_size_t()
+        self.check(fn(handle, param, 0, None, ct.byref(size)), 'get info')
+        buf = ct.create_string_buffer(size.value)
+        self.check(fn(handle, param, size.value, buf, None), 'get info')
+        return buf.value.decode('utf-8', 'replace').strip()
+
+    def _info_int(self, fn, handle, param, ctype):
+        ct = self.ct
+        val = ctype()
+        self.check(fn(handle, param, ct.sizeof(val), ct.byref(val), None), 'get info')
+        return val.value
+
+    def platforms(self):
+        ct = self.ct
+        n = ct.c_uint32()
+        code = self.lib.clGetPlatformIDs(0, None, ct.byref(n))
+        if code != 0 or n.value == 0:
+            return []
+        ids = (ct.c_void_p * n.value)()
+        self.check(self.lib.clGetPlatformIDs(n.value, ids, None), 'clGetPlatformIDs')
+        out = []
+        for pid in ids:
+            out.append(_CLPlatform(self, pid, self._info_str(self.lib.clGetPlatformInfo, pid, _CL_PLATFORM_NAME), self._info_str(self.lib.clGetPlatformInfo, pid, _CL_PLATFORM_VENDOR)))
+        return out
+
+    def devices(self, platform, kind=_CL_DEVICE_TYPE_ALL):
+        ct = self.ct
+        n = ct.c_uint32()
+        code = self.lib.clGetDeviceIDs(platform.handle, kind, 0, None, ct.byref(n))
+        if code == _CL_DEVICE_NOT_FOUND or n.value == 0:
+            return []
+        self.check(code, 'clGetDeviceIDs')
+        ids = (ct.c_void_p * n.value)()
+        self.check(self.lib.clGetDeviceIDs(platform.handle, kind, n.value, ids, None), 'clGetDeviceIDs')
+        out = []
+        for did in ids:
+            f = self.lib.clGetDeviceInfo
+            out.append(_CLDevice(did, platform, self._info_str(f, did, _CL_DEVICE_NAME), self._info_int(f, did, _CL_DEVICE_TYPE, ct.c_uint64), self._info_int(f, did, _CL_DEVICE_MAX_COMPUTE_UNITS, ct.c_uint32)))
+        return out
+
+class _CLPlatform(object):
+
+    def __init__(self, cl, handle, name, vendor):
+        self.handle, self.name, self.vendor = (handle, name, vendor)
+
+class _CLDevice(object):
+
+    def __init__(self, handle, platform, name, kind, units):
+        self.handle, self.platform, self.name, self.type, self.compute_units = (handle, platform, name, kind, units)
+
+    def kind_name(self):
+        if self.type & _CL_DEVICE_TYPE_GPU:
+            return 'GPU'
+        if self.type & _CL_DEVICE_TYPE_CPU:
+            return 'CPU'
+        return 'other'
+
+class CLSession(object):
+    """A context, queue and built program on one device."""
+
+    def __init__(self, cl, device, source):
+        ct = self.ct = cl.ct
+        self.cl, self.lib, self.device = (cl, cl.lib, device)
+        err = ct.c_int32()
+        dev = (ct.c_void_p * 1)(device.handle)
+        self.ctx = self.lib.clCreateContext(None, 1, dev, None, None, ct.byref(err))
+        cl.check(err.value, 'clCreateContext')
+        self.queue = self.lib.clCreateCommandQueue(self.ctx, device.handle, 0, ct.byref(err))
+        cl.check(err.value, 'clCreateCommandQueue')
+        src = source.encode('utf-8')
+        srcs = (ct.c_char_p * 1)(src)
+        lens = (ct.c_size_t * 1)(len(src))
+        self.prog = self.lib.clCreateProgramWithSource(self.ctx, 1, srcs, lens, ct.byref(err))
+        cl.check(err.value, 'clCreateProgramWithSource')
+        code = self.lib.clBuildProgram(self.prog, 1, dev, b'', None, None)
+        if code != 0:
+            raise RuntimeError('OpenCL kernel build failed (%d): %s' % (code, self._build_log()[-600:]))
+        self._kernels = {}
+
+    def _build_log(self):
+        ct = self.ct
+        size = ct.c_size_t()
+        if self.lib.clGetProgramBuildInfo(self.prog, self.device.handle, _CL_PROGRAM_BUILD_LOG, 0, None, ct.byref(size)) != 0:
+            return ''
+        buf = ct.create_string_buffer(size.value + 1)
+        self.lib.clGetProgramBuildInfo(self.prog, self.device.handle, _CL_PROGRAM_BUILD_LOG, size.value, buf, None)
+        return buf.value.decode('utf-8', 'replace')
+
+    def buffer(self, data=None, size=None):
+        """A device buffer, filled from data (bytes) or of size bytes."""
+        ct = self.ct
+        err = ct.c_int32()
+        if data is not None:
+            data = bytes(data) or b'\0'
+            host = ct.create_string_buffer(data, len(data))
+            mem = self.lib.clCreateBuffer(self.ctx, _CL_MEM_READ_ONLY | _CL_MEM_COPY_HOST_PTR, len(data), host, ct.byref(err))
+        else:
+            mem = self.lib.clCreateBuffer(self.ctx, _CL_MEM_READ_WRITE, max(1, int(size)), None, ct.byref(err))
+        self.cl.check(err.value, 'clCreateBuffer')
+        return _CLBuffer(mem)
+
+    def buffer_rw(self, data):
+        """A read-write buffer filled from data."""
+        ct = self.ct
+        err = ct.c_int32()
+        host = ct.create_string_buffer(bytes(data), len(data))
+        mem = self.lib.clCreateBuffer(self.ctx, _CL_MEM_READ_WRITE | _CL_MEM_COPY_HOST_PTR, len(data), host, ct.byref(err))
+        self.cl.check(err.value, 'clCreateBuffer')
+        return _CLBuffer(mem)
+
+    def release(self, *bufs):
+        for b in bufs:
+            if b.handle:
+                self.lib.clReleaseMemObject(b.handle)
+                b.handle = None
+
+    def run(self, name, n, *args):
+        """Launch kernel name over n work items and wait for it. args are
+        _CLBuffer objects or ctypes scalars (c_uint32, c_uint64)."""
+        ct = self.ct
+        if n <= 0:
+            return
+        k = self._kernels.get(name)
+        if k is None:
+            err = ct.c_int32()
+            k = self.lib.clCreateKernel(self.prog, name.encode('ascii'), ct.byref(err))
+            self.cl.check(err.value, 'clCreateKernel %s' % name)
+            self._kernels[name] = k
+        for i, a in enumerate(args):
+            if isinstance(a, _CLBuffer):
+                h = ct.c_void_p(a.handle)
+                self.cl.check(self.lib.clSetKernelArg(k, i, ct.sizeof(h), ct.byref(h)), 'clSetKernelArg')
+            else:
+                self.cl.check(self.lib.clSetKernelArg(k, i, ct.sizeof(a), ct.byref(a)), 'clSetKernelArg')
+        gsize = (ct.c_size_t * 1)(int(n))
+        self.cl.check(self.lib.clEnqueueNDRangeKernel(self.queue, k, 1, None, gsize, None, 0, None, None), 'clEnqueueNDRangeKernel %s' % name)
+        self.cl.check(self.lib.clFinish(self.queue), 'clFinish')
+
+    def read(self, buf, size):
+        ct = self.ct
+        out = ct.create_string_buffer(int(size))
+        self.cl.check(self.lib.clEnqueueReadBuffer(self.queue, buf.handle, 1, 0, int(size), out, 0, None, None), 'clEnqueueReadBuffer')
+        return out.raw
+
+class _CLBuffer(object):
+
+    def __init__(self, handle):
+        self.handle = handle
+
+def _u32(values):
+    return struct.pack('<%dI' % len(values), *values)
+
+def _u8(values):
+    return bytes(bytearray(values))
+
+def _cl_u32(v):
+    import ctypes
+    return ctypes.c_uint32(int(v))
+
+def _cl_u64(v):
+    import ctypes
+    return ctypes.c_uint64(int(v))
+
+def _opencl_devices(cl):
+    """The OpenCL devices --gpu may use, best first: GPUs only, unless
+    UNMICRO_OPENCL_DEVICE names a device (any type, by part of its own or
+    its platform's name), which is also how an OpenCL CPU runtime such as
+    pocl is chosen for testing."""
+    want = os.environ.get('UNMICRO_OPENCL_DEVICE', '').strip().lower()
+    out = []
+    for plat in cl.platforms():
+        try:
+            devs = cl.devices(plat, _CL_DEVICE_TYPE_ALL if want else _CL_DEVICE_TYPE_GPU)
+        except RuntimeError:
+            continue
+        for d in devs:
+            if want and want not in d.name.lower() and want not in plat.name.lower():
+                continue
+            out.append(d)
+    return out
+
+def _magic_table(magics):
+    """The packed signature table the kernels match decrypted blocks
+    against: (bytes, offsets into them, block offsets, lengths, count)."""
+    mb, mo, mat, mlen = (bytearray(), [], [], [])
+    for off, magic in magics:
+        mo.append(len(mb))
+        mat.append(off)
+        mlen.append(len(magic))
+        mb.extend(magic)
+    return (bytes(mb) or b'\0', _u32(mo or [0]), _u8(mat or [0]), _u8(mlen or [0]), len(mo))
+
+def _cpu_magic_hit(block, magics):
+    for off, magic in magics:
+        if block[off:off + len(magic)] == magic:
+            return True
+    return False
+
 class GpuAES(object):
 
     def __init__(self):
-        import pyopencl as cl
-        import numpy as np
-        self.cl, self.np = (cl, np)
-        devices = _opencl_devices(cl)
+        self.cl = OpenCL()
+        devices = _opencl_devices(self.cl)
         if not devices:
             raise RuntimeError('no OpenCL GPU device found (NVIDIA or AMD drivers and an ICD must be installed)')
         self.device = devices[0]
-        self.name = self.device.name.strip()
-        self.ctx = cl.Context([self.device])
-        self.queue = cl.CommandQueue(self.ctx)
-        self.prog = cl.Program(self.ctx, _gpu_kernel_source()).build()
-        self._magics = [(off, np.frombuffer(magic, dtype=np.uint8)) for off, magic, _, _ in SIGNATURES if off + len(magic) <= 16]
-        mb, mo, mat, mlen = ([], [], [], [])
-        for off, magic, _, _ in SIGNATURES:
-            if off + len(magic) <= 16 and len(magic) >= _GPU_MIN_MAGIC:
-                mo.append(len(mb))
-                mat.append(off)
-                mlen.append(len(magic))
-                mb.extend(magic)
-        self._mbytes = np.array(mb or [0], dtype=np.uint8)
-        self._moff = np.array(mo or [0], dtype=np.uint32)
-        self._mat = np.array(mat or [0], dtype=np.uint8)
-        self._mlen = np.array(mlen or [0], dtype=np.uint8)
-        self._M = len(mo)
+        self.name = self.device.name
+        self.s = CLSession(self.cl, self.device, _gpu_kernel_source())
+        self._magics = [(off, bytes(magic)) for off, magic, _, _ in SIGNATURES if off + len(magic) <= 16]
+        self._all_table = _magic_table(self._magics)
+        self._strong = [(off, m) for off, m in self._magics if len(m) >= _GPU_MIN_MAGIC]
+        self._table = _magic_table(self._strong)
+        self._M = self._table[4]
         self.alphabet = None
 
     def set_alphabet(self, alphabet):
-        np = self.np
         self.alphabet = list(alphabet)
-        ab, ao, al = ([], [], [])
+        ab, ao, al = (bytearray(), [], [])
         for ch in self.alphabet:
             b = ch.encode('utf-8')
             ao.append(len(ab))
             al.append(len(b))
             ab.extend(b)
-        self._alpha = np.array(ab, dtype=np.uint8)
-        self._aoff = np.array(ao, dtype=np.uint32)
-        self._alen = np.array(al, dtype=np.uint8)
+        self._alpha = bytes(ab)
+        self._aoff = _u32(ao)
+        self._alen = _u8(al)
         self._N = len(self.alphabet)
 
     def decrypt_blocks(self, keys, ct16):
-        cl, np = (self.cl, self.np)
-        n = keys.shape[0]
-        mf = cl.mem_flags
-        keys = np.ascontiguousarray(keys, dtype=np.uint8)
-        ctnp = np.frombuffer(ct16, dtype=np.uint8).copy()
-        kbuf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=keys)
-        cbuf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=ctnp)
-        out = np.empty((n, 16), dtype=np.uint8)
-        obuf = cl.Buffer(self.ctx, mf.WRITE_ONLY, out.nbytes)
-        self.prog.aes256_ecb_decrypt(self.queue, (n,), None, kbuf, cbuf, obuf, np.uint32(n))
-        cl.enqueue_copy(self.queue, out, obuf)
-        self.queue.finish()
-        return out
+        """keys: n 32-byte keys back to back. Returns the n decrypted
+        blocks back to back."""
+        n = len(keys) // 32
+        s = self.s
+        kb, cb, ob = (s.buffer(keys), s.buffer(ct16), s.buffer(size=n * 16))
+        try:
+            s.run('aes256_ecb_decrypt', n, kb, cb, ob, _cl_u32(n))
+            return s.read(ob, n * 16)
+        finally:
+            s.release(kb, cb, ob)
+
+    def magic_flags(self, keys, ct16, table):
+        """One byte per key: 1 where its decrypt of ct16 starts with a
+        signature in table, matched on the device."""
+        n = len(keys) // 32
+        s = self.s
+        mb, mo, mat, mlen, M = table
+        bufs = [s.buffer(keys), s.buffer(ct16), s.buffer(mb), s.buffer(mo), s.buffer(mat), s.buffer(mlen)]
+        fb = s.buffer(size=n)
+        try:
+            s.run('aes256_ecb_magic', n, *bufs + [_cl_u32(M), fb, _cl_u32(n)])
+            return s.read(fb, n)
+        finally:
+            s.release(fb, *bufs)
 
     def selftest(self, trials=1024):
-        np = self.np
-        keys = np.frombuffer(os.urandom(trials * 32), dtype=np.uint8).reshape(trials, 32)
+        keys = os.urandom(trials * 32)
         block = os.urandom(16)
         gpu = self.decrypt_blocks(keys, block)
-        for i in range(trials):
-            if bytes(gpu[i]) != _dec_blocks(bytes(keys[i]), block):
+        cpu = [_dec_blocks(keys[i * 32:(i + 1) * 32], block) for i in range(trials)]
+        if any((gpu[i * 16:(i + 1) * 16] != cpu[i] for i in range(trials))):
+            return False
+        # The on-device signature match, on a table built from some of
+        # these very blocks so that it has hits to find, plus the real one.
+        planted = [(i % 9, cpu[i][i % 9:i % 9 + 3 + i % 5]) for i in range(0, trials, 37)]
+        for magics in (planted, self._magics):
+            flags = self.magic_flags(keys, block, _magic_table(magics))
+            want = bytes((1 if _cpu_magic_hit(b, magics) else 0 for b in cpu))
+            if bytes(flags) != want:
                 return False
         return True
 
     def filter_chunk(self, candidates, probes):
-        np = self.np
-        keys = np.frombuffer(b''.join((key_bytes(c) for c in candidates)), dtype=np.uint8).reshape(len(candidates), 32)
-        flagged = np.zeros(len(candidates), dtype=bool)
+        keys = b''.join((key_bytes(c) for c in candidates))
+        flagged = bytearray(len(candidates))
         for blk, _ in probes:
-            out = self.decrypt_blocks(keys, blk)
-            for off, magic in self._magics:
-                flagged |= np.all(out[:, off:off + len(magic)] == magic, axis=1)
-        return [candidates[i] for i in np.nonzero(flagged)[0]]
+            for i, f in enumerate(self.magic_flags(keys, blk, self._all_table)):
+                if f:
+                    flagged[i] = 1
+        return [c for c, f in zip(candidates, flagged) if f]
 
     def brute_length(self, length, probes, start, count, out_cap=1 << 16):
-        cl, np = (self.cl, self.np)
-        mf = cl.mem_flags
-        RO = mf.READ_ONLY | mf.COPY_HOST_PTR
-        a_b = cl.Buffer(self.ctx, RO, hostbuf=self._alpha)
-        a_o = cl.Buffer(self.ctx, RO, hostbuf=self._aoff)
-        a_l = cl.Buffer(self.ctx, RO, hostbuf=self._alen)
-        m_b = cl.Buffer(self.ctx, RO, hostbuf=self._mbytes)
-        m_o = cl.Buffer(self.ctx, RO, hostbuf=self._moff)
-        m_a = cl.Buffer(self.ctx, RO, hostbuf=self._mat)
-        m_l = cl.Buffer(self.ctx, RO, hostbuf=self._mlen)
+        s = self.s
+        mb, mo, mat, mlen, M = self._table
+        fixed = [s.buffer(self._alpha), s.buffer(self._aoff), s.buffer(self._alen)]
+        table = [s.buffer(mb), s.buffer(mo), s.buffer(mat), s.buffer(mlen)]
         hit = set()
-        for blk, _ in probes:
-            ctnp = np.frombuffer(blk, dtype=np.uint8).copy()
-            c_b = cl.Buffer(self.ctx, RO, hostbuf=ctnp)
-            out_idx = np.empty(out_cap, dtype=np.uint32)
-            out_cnt = np.zeros(1, dtype=np.uint32)
-            oi = cl.Buffer(self.ctx, mf.WRITE_ONLY, out_idx.nbytes)
-            oc = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=out_cnt)
-            self.prog.aes256_brute_mask(self.queue, (int(count),), None, a_b, a_o, a_l, np.uint32(self._N), np.uint32(length), np.uint64(start), np.uint32(count), c_b, m_b, m_o, m_a, m_l, np.uint32(self._M), oi, oc, np.uint32(out_cap))
-            cl.enqueue_copy(self.queue, out_cnt, oc)
-            self.queue.finish()
-            n = int(out_cnt[0])
-            if n:
-                cl.enqueue_copy(self.queue, out_idx, oi)
-                self.queue.finish()
-                for g in out_idx[:min(n, out_cap)]:
-                    hit.add(int(g))
+        try:
+            for blk, _ in probes:
+                c_b = s.buffer(blk)
+                oi = s.buffer(size=out_cap * 4)
+                oc = s.buffer_rw(_u32([0]))
+                try:
+                    s.run('aes256_brute_mask', int(count), *fixed + [_cl_u32(self._N), _cl_u32(length), _cl_u64(start), _cl_u32(count), c_b] + table + [_cl_u32(M), oi, oc, _cl_u32(out_cap)])
+                    n = struct.unpack('<I', s.read(oc, 4))[0]
+                    if n:
+                        k = min(n, out_cap)
+                        for g in struct.unpack('<%dI' % k, s.read(oi, k * 4)):
+                            hit.add(int(g))
+                finally:
+                    s.release(c_b, oi, oc)
+        finally:
+            s.release(*fixed + table)
         return [_decode_index(start + g, self.alphabet, length) for g in sorted(hit)]
 
     def mask_selftest(self, length=4, sample=200000):
@@ -3097,27 +3410,14 @@ class GpuAES(object):
         sample = int(min(sample, self._N ** length))
         ct = os.urandom(16)
         gpu_hits = set(self.brute_length(length, [(ct, None)], 0, sample))
-        strong = [(off, m) for off, m in self._magics if len(m) >= _GPU_MIN_MAGIC]
         cpu_hits = set()
         for idx in range(sample):
             cand = _decode_index(idx, self.alphabet, length)
-            pt = _dec_blocks(key_bytes(cand), ct)
-            for off, magic in strong:
-                if pt[off:off + len(magic)] == bytes(magic):
-                    cpu_hits.add(cand)
-                    break
+            if _cpu_magic_hit(_dec_blocks(key_bytes(cand), ct), self._strong):
+                cpu_hits.add(cand)
         return gpu_hits == cpu_hits
 
 def init_gpu(quiet=False):
-    try:
-        import pyopencl
-    except Exception:
-        if not quiet:
-            print('--gpu needs pyopencl and OpenCL drivers, which are not present.')
-            print('Install with: pip install pyopencl (plus your NVIDIA or AMD')
-            print('OpenCL runtime). Falling back to the CPU.')
-            print()
-        return None
     try:
         gpu = GpuAES()
     except Exception as e:
@@ -3293,41 +3593,19 @@ __kernel void pbkdf2_sha256_rounds(__global uint* state, const uint n, const uin
 # launch overhead does not count.
 GPU_KDF_LAUNCH_SECS = 0.25
 
-def _opencl_devices(cl):
-    """The OpenCL devices --gpu may use, best first: GPUs only, unless
-    UNMICRO_OPENCL_DEVICE names a device (any type, by part of its own or
-    its platform's name), which is also how an OpenCL CPU runtime such as
-    pocl is chosen for testing."""
-    want = os.environ.get('UNMICRO_OPENCL_DEVICE', '').strip().lower()
-    out = []
-    for plat in cl.get_platforms():
-        try:
-            devs = plat.get_devices() if want else plat.get_devices(device_type=cl.device_type.GPU)
-        except cl.Error:
-            continue
-        for d in devs:
-            if want and want not in d.name.lower() and want not in plat.name.lower():
-                continue
-            out.append(d)
-    return out
-
 class GpuPBKDF2(object):
     """Batch PBKDF2-HMAC-SHA256 on an OpenCL device, for the GCM files."""
 
     def __init__(self):
-        import pyopencl as cl
-        import numpy as np
-        self.cl, self.np = (cl, np)
-        devices = _opencl_devices(cl)
+        self.cl = OpenCL()
+        devices = _opencl_devices(self.cl)
         if not devices:
             raise RuntimeError('no OpenCL GPU device found (NVIDIA or AMD drivers and an ICD must be installed)')
         self.device = devices[0]
-        self.name = self.device.name.strip()
-        self.ctx = cl.Context([self.device])
-        self.queue = cl.CommandQueue(self.ctx)
-        self.prog = cl.Program(self.ctx, _GPU_PBKDF2_KERNEL).build()
-        units = max(1, int(self.device.max_compute_units))
-        if self.device.type & cl.device_type.GPU:
+        self.name = self.device.name
+        self.s = CLSession(self.cl, self.device, _GPU_PBKDF2_KERNEL)
+        units = max(1, int(self.device.compute_units))
+        if self.device.type & _CL_DEVICE_TYPE_GPU:
             self.batch = units * 256
         else:
             self.batch = units * 4
@@ -3348,49 +3626,40 @@ class GpuPBKDF2(object):
     def derive_keys(self, key_strings, salts, iters=GCM_KDF_ITERS):
         return self.derive([_gcm_password(k) for k in key_strings], salts, iters)
 
-    def _packed(self, items):
-        np = self.np
-        off, ln, buf = ([], [], [])
-        pos = 0
+    @staticmethod
+    def _packed(items):
+        off, ln, pos = ([], [], 0)
         for b in items:
             off.append(pos)
             ln.append(len(b))
-            buf.append(bytes(b))
             pos += len(b)
-        data = np.frombuffer(b''.join(buf) or b'\0', dtype=np.uint8).copy()
-        return (data, np.array(off, dtype=np.uint32), np.array(ln, dtype=np.uint32))
+        return (b''.join((bytes(b) for b in items)), _u32(off), _u32(ln))
 
     def _derive_batch(self, passwords, salts, iters):
-        cl, np = (self.cl, self.np)
         n = len(passwords)
         if n == 0:
             return []
         if iters < 1:
             raise ValueError('iters must be at least 1')
-        mf = cl.mem_flags
-        RO = mf.READ_ONLY | mf.COPY_HOST_PTR
-        pw, pw_off, pw_len = self._packed(passwords)
-        sa, sa_off, sa_len = self._packed(salts)
-        bufs = [cl.Buffer(self.ctx, RO, hostbuf=a) for a in (pw, pw_off, pw_len, sa, sa_off, sa_len)]
-        state = cl.Buffer(self.ctx, mf.READ_WRITE, n * 32 * 4)
-        self.prog.pbkdf2_sha256_init(self.queue, (n,), None, *bufs + [state, np.uint32(n)])
-        self.queue.finish()
-        left = iters - 1
-        while left > 0:
-            rounds = min(left, self._rounds)
-            t0 = time.time()
-            self.prog.pbkdf2_sha256_rounds(self.queue, (n,), None, state, np.uint32(n), np.uint32(rounds))
-            self.queue.finish()
-            took = time.time() - t0
-            left -= rounds
-            if rounds == self._rounds:
-                scale = GPU_KDF_LAUNCH_SECS / max(took, 1e-4)
-                self._rounds = int(max(16, min(1 << 20, self._rounds * min(4.0, max(0.25, scale)))))
-        words = np.empty(n * 32, dtype=np.uint32)
-        cl.enqueue_copy(self.queue, words, state)
-        self.queue.finish()
-        t = words.reshape(n, 32)[:, 24:32].astype('>u4')
-        return [t[i].tobytes() for i in range(n)]
+        s = self.s
+        bufs = [s.buffer(a) for a in self._packed(passwords) + self._packed(salts)]
+        state = s.buffer(size=n * 32 * 4)
+        try:
+            s.run('pbkdf2_sha256_init', n, *bufs + [state, _cl_u32(n)])
+            left = iters - 1
+            while left > 0:
+                rounds = min(left, self._rounds)
+                t0 = time.time()
+                s.run('pbkdf2_sha256_rounds', n, state, _cl_u32(n), _cl_u32(rounds))
+                took = time.time() - t0
+                left -= rounds
+                if rounds == self._rounds:
+                    scale = GPU_KDF_LAUNCH_SECS / max(took, 1e-4)
+                    self._rounds = int(max(16, min(1 << 20, self._rounds * min(4.0, max(0.25, scale)))))
+            words = struct.unpack('<%dI' % (n * 32), s.read(state, n * 32 * 4))
+        finally:
+            s.release(state, *bufs)
+        return [struct.pack('>8I', *words[i * 32 + 24:i * 32 + 32]) for i in range(n)]
 
     def selftest(self):
         """Every byte of the derived keys must equal hashlib.pbkdf2_hmac, over
@@ -3420,10 +3689,6 @@ class GpuPBKDF2(object):
 def init_gpu_gcm(quiet=False):
     """The GPU for the GCM files' key derivation, or None to use the CPU.
     Like init_gpu, nothing is used until its self-test has matched the CPU."""
-    try:
-        import pyopencl
-    except Exception:
-        return None
     try:
         gpu = GpuPBKDF2()
     except Exception as e:
@@ -3572,7 +3837,7 @@ def run_once(argv):
     g_key.add_argument('--brute', action='store_true', help="if the known keys fail, generate and sweep candidates modelled on this crew's key history")
     g_key.add_argument('--deep', action='store_true', help='with --brute, widen every generator. Hours, not seconds')
     g_key.add_argument('--workers', type=int, default=None, metavar='N', help='parallel worker processes for the sweep. Defaults to every CPU core on this machine, to push the guessing as fast as the hardware allows. Set 1 to stay single-process, e.g. to keep a victim machine responsive')
-    g_key.add_argument('--gpu', action='store_true', help='use an OpenCL GPU (NVIDIA or AMD) for the sweep: AES for the older files, the PBKDF2 key stretch for the GCM files. Needs pyopencl and OpenCL drivers. Each use runs a self-test against the CPU first and falls back to the CPU unless it passes, and the CPU checks every GCM key against the full tag, so it can never return a wrong result or miss a key')
+    g_key.add_argument('--gpu', action='store_true', help='use an OpenCL GPU (NVIDIA or AMD) for the sweep: AES for the older files, the PBKDF2 key stretch for the GCM files. Needs the OpenCL that comes with the graphics driver; nothing else to install. Each use runs a self-test against the CPU first and falls back to the CPU unless it passes, and the CPU checks every GCM key against the full tag, so it can never return a wrong result or miss a key')
     g_key.add_argument('--gpu-info', dest='gpu_info', action='store_true', help='list the OpenCL platforms and devices found, and exit')
     g_key.add_argument('--max-passes', type=int, default=8, help='how many times to sweep for keys. One pass can turn up several keys; each extra pass targets only the files no key covers yet, which is how an interrupted encryption run is picked up (default 8, 1 disables the extra passes)')
     g_key.add_argument('--max-candidates', type=int, help='give up after this many guesses')
@@ -3606,22 +3871,24 @@ def run_once(argv):
 
     if args.gpu_info:
         try:
-            import pyopencl as cl
-        except Exception:
-            print('pyopencl is not installed.  pip install pyopencl')
+            cl = OpenCL()
+            plats = cl.platforms()
+        except Exception as e:
+            print('No OpenCL found (%s).' % e)
+            print('--gpu uses the OpenCL that comes with an NVIDIA or AMD graphics driver.')
             return 1
-        plats = cl.get_platforms()
         if not plats:
-            print('No OpenCL platforms found. Install your NVIDIA or AMD OpenCL runtime.')
+            print('No OpenCL platforms found. Install or update your NVIDIA or AMD graphics driver.')
             return 1
         for p in plats:
-            print('Platform: %s (%s)' % (p.name.strip(), p.vendor.strip()))
-            for d in p.get_devices():
-                try:
-                    kind = cl.device_type.to_string(d.type)
-                except Exception:
-                    kind = '?'
-                print('    %-8s %s' % (kind, d.name.strip()))
+            print('Platform: %s (%s)' % (p.name, p.vendor))
+            try:
+                devs = cl.devices(p)
+            except RuntimeError as e:
+                print('    (devices could not be listed: %s)' % e)
+                continue
+            for d in devs:
+                print('    %-8s %s' % (d.kind_name(), d.name))
         return 0
 
     _init_backend(args.pure_python)
@@ -4462,7 +4729,7 @@ CUSTOM_OPTIONS = [('I have a key (or several)', ''),
                   ('Also try the fitted model of how these operators type keys', ''),
                   ('Also try structural brute force', 'slow'),
                   ('Widen every search', 'much slower; needs the fitted model'),
-                  ('Use the GPU', 'needs pyopencl'),
+                  ('Use the GPU', 'NVIDIA or AMD graphics driver'),
                   ('Save progress so a long run can resume', '')]
 
 def ui_step_custom(st):

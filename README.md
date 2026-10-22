@@ -613,6 +613,9 @@ These are real and are not regressions:
 
 ## What's new
 
+- **The GPU from the downloads (5.1.1).** `--gpu` and the window's "Use the
+  graphics card" now work in the downloads, using the OpenCL that comes with
+  the NVIDIA or AMD graphics driver. Nothing else to install.
 - **`--gpu` for the GCM files (5.1).** The 600,000-round key stretch behind
   every guess on the newer files now runs on the GPU, checked against the
   CPU before use. See [GPU acceleration](#gpu-acceleration-optional-experimental).
@@ -696,17 +699,23 @@ each work item turns its own index into a candidate, builds the key, decrypts,
 and checks the result. Nothing but the rare hit crosses the bus, so it runs at
 the card's speed. One OpenCL kernel covers both NVIDIA and AMD.
 
-**Run it from the Python source, not the downloads.** The GPU needs
-`pyopencl` and your GPU's OpenCL runtime, which the downloads do not bundle
-(and most victim machines do not have). GPU is the operator's cracking path.
-From source, the window's "Use the graphics card" switch (Search tab) works
-too, once `pyopencl` is installed:
+**It works from the downloads, with nothing to install.** Since 5.1.1 unmicro
+talks to OpenCL directly, through the OpenCL library that every NVIDIA and AMD
+graphics driver installs (`OpenCL.dll` on Windows, `libOpenCL.so.1` on
+Linux). No Python package is needed, from the downloads or from source. In the
+window it is the "Use the graphics card" switch on the Search tab, and
+"Check GPU" shows what was found. On the command line:
 
 ```
-pip install pyopencl numpy      # plus your NVIDIA or AMD OpenCL runtime
-python3 unmicro.py --gpu-info                        # what OpenCL sees
-python3 unmicro.py --in ./encrypted --out ./rec --dumb-brute --gpu
+unmicro --cli --gpu-info                                  # what OpenCL sees
+unmicro --cli --in ./encrypted --out ./rec --dumb-brute --gpu
 ```
+
+On a machine with no graphics driver (or a card without OpenCL) `--gpu` says
+so and the run carries on on the CPU. On Linux, if `--gpu-info` finds no
+OpenCL library although the driver is installed, install the OpenCL loader
+(`ocl-icd-libopencl1` on Debian and Ubuntu, `ocl-icd` on Fedora), or point
+`UNMICRO_OPENCL_LIB` at the library.
 
 The fitted-model tier stays on the CPU (its candidates come from Python logic
 that does not map to a GPU); the big win is the structural brute.
@@ -741,28 +750,27 @@ runtime used to test this, set `UNMICRO_OPENCL_DEVICE` to part of its name
 (`--gpu-info` lists them):
 
 ```
-pip install pyopencl numpy pocl-binary-distribution
+sudo apt install pocl-opencl-icd        # or your distribution's pocl package
 UNMICRO_OPENCL_DEVICE=portable python3 -m unittest tests.test_gpu_gcm -v
 ```
 
-It is opt-in, and safe by construction for a recovery tool. Key derivation stays
-on the CPU, so nothing is mis-encoded on the device. Two self-tests run before
-the GPU is trusted for a single real candidate: it decrypts random blocks under
-random keys and requires every byte to match the CPU AES back end, and it runs
-the on-device brute over a sample and requires its hit set to equal the CPU's
-over the same candidates. Any mismatch disables the GPU and the whole run
+It is opt-in, and safe by construction for a recovery tool. Self-tests run
+before the GPU is trusted for a single real candidate: it decrypts random
+blocks under random keys and requires every byte to match the CPU AES back
+end, its on-device signature match must flag exactly the blocks the CPU
+flags, and it runs the on-device brute over a sample and requires its hit set
+to equal the CPU's over the same candidates. Any mismatch disables the GPU and the whole run
 continues on the CPU, and every GPU hit is re-validated on the CPU before it
 counts. So the GPU can make the search faster, or on hardware where the kernel
 does not hold up simply not engage. It cannot make the search wrong or miss a
 key.
 
-This path is **new and experimental in 3.6**, and it was developed without a GPU
-in the build environment. The kernel's AES-256 logic and the index-to-candidate
-brute were verified against a reference implementation on random vectors, but
-the OpenCL execution itself should be confirmed on your own card: run `--gpu`
-and look for `GPU ready: …` followed by `GPU brute self-test passed`. If you see
-a self-test failure instead, it has already fallen back to the CPU; please
-report the device.
+This path is **experimental**. Every self-test passes on an NVIDIA RTX 3060 and
+on pocl (an OpenCL runtime on the CPU); AMD cards have not been tried yet.
+Confirm it on your own card: run `--gpu` and look for `GPU ready: …` (and,
+with GCM files, `GPU ready for the GCM files: …`; with `--dumb-brute`,
+`GPU brute self-test passed`). If you see a self-test failure instead, it has
+already fallen back to the CPU; please report the device.
 
 ## Options worth knowing
 

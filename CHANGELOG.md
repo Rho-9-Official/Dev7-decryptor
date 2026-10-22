@@ -2,6 +2,31 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 5.1.1
+
+### Fixed
+- **`--gpu` works from the downloads.** Until now the GPU needed `pyopencl`
+  and `numpy`, which the downloads do not include, so `--gpu` (and the
+  window's "Use the graphics card") fell back to the CPU there: only people
+  running the Python source could use a GPU, for either format. unmicro now
+  calls the OpenCL library that the NVIDIA or AMD graphics driver installs
+  (`OpenCL.dll`, `libOpenCL.so.1`) directly through ctypes, with no Python
+  package at all, from the downloads and from source.
+
+### Changed
+- The older format's GPU filter matches file signatures on the device
+  (a new kernel) instead of in numpy on the host, and its self-test now
+  checks that match against the CPU too.
+- `--gpu-info` uses the same OpenCL layer and says when no driver OpenCL is
+  found. `UNMICRO_OPENCL_LIB` points it at a particular OpenCL library.
+- The kernels, self-tests and fall-back to the CPU are unchanged otherwise.
+
+### Tested
+- On an NVIDIA RTX 3060 and on pocl through the system OpenCL loader, with
+  no pyopencl or numpy installed: every GPU self-test, and the test suite.
+- New tests: the older format's GPU filter against the CPU, and a machine
+  with no OpenCL library at all (both GPU paths fall back to the CPU).
+
 ## 5.1.0
 
 ### Added
@@ -34,7 +59,7 @@ All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
   such as pocl is used for testing.
 - `tests/test_gpu_gcm.py`: the kernel against hashlib, the search and
   mapping with the GPU against the CPU result, and stand-ins for a broken and a
-  failing GPU. The device tests are skipped without pyopencl and a device.
+  failing GPU. The device tests are skipped without an OpenCL device.
 
 ### Changed
 - The GPU self-test for the older files and the one for the GCM files are
