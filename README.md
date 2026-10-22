@@ -76,21 +76,29 @@ where you were hit. Rho-9 sends a key back once your case is confirmed. There
 is no charge for the key. If you already have a key from a previous build, we
 will send you the new one with any update to your case, same channel.
 
-**Supplying the key.** Three ways, pick whichever fits:
+**Supplying the key.** In the window, paste it on the **Keys** tab and press
+**Check licence**: it confirms the key and shows how many recovered keys this
+build knows. Switch on **Remember the licence on this computer** to keep it
+for next time (it is saved in your own settings file, readable only by you on
+Linux and macOS; leave it off on a shared machine). The key is never put on a
+command line: the window hands it to the engine privately.
+
+On the command line (`--cli`, or `unmicro.py` from source), three ways:
 
 ```
-# at the command line
-unmicro.py --license YOUR-LICENSE-KEY --auto --out recovered
+# as an option
+unmicro --cli --license YOUR-LICENSE-KEY --auto --out recovered
 
 # or as an environment variable, nice for long sessions
 export UNMICRO_LICENSE=YOUR-LICENSE-KEY
-unmicro.py --auto --out recovered
+unmicro --cli --auto --out recovered
 
 # or just run it and it will prompt
-unmicro.py --auto --out recovered
+unmicro --cli --auto --out recovered
 License key:
 ```
 
+(`unmicro` here stands for the file you downloaded, or `python3 unmicro.py`.)
 The prompt uses hidden input (like a password prompt), so the key does not
 land in your terminal scrollback.
 
@@ -167,6 +175,10 @@ sha256sum -c --ignore-missing SHA256SUMS && chmod +x "$f" && "./$f"
 
 This download is x86_64 only. On ARM Linux, a Raspberry Pi, or anything with a
 glibc older than 2.35, run from source below.
+
+On a Linux machine without a desktop (a server, or over SSH), the window
+cannot open, but the command line inside the same file works:
+`./unmicro-<version>-linux-x86_64 --cli --auto --out ./recovered`.
 
 ### From source (Termux, ARM, macOS, or if you would rather read the code first)
 
@@ -286,7 +298,16 @@ pip install pycryptodome     # optional, strongly recommended before --brute
 
 The built in implementation is far slower than a compiled back end. It is fine
 for trying the recovered keys, but if you intend to use `--brute`, install
-`pycryptodome` or use a binary.
+`pycryptodome` or use a download.
+
+**The window from source** (`python3 -m unmicro_app`) needs Tkinter, which
+comes with most Python installs (on Debian and Ubuntu: `sudo apt install
+python3-tk`). For the modern window install PySide6, and for CPU temperature,
+battery and memory readings install psutil:
+
+```
+pip install PySide6-Essentials psutil     # optional
+```
 
 `--pure-python` forces the built in implementation even when a library is
 available.
@@ -296,7 +317,7 @@ The first line of output always reports which back end is in use, for example
 
 **Extension repair** (see below) uses the `filetype` library when it is present.
 It is pure Python with no other dependencies, so it installs cleanly on Termux
-and is bundled into the released binaries.
+and is bundled into the downloads.
 
 ```
 pip install filetype        # recommended, for the broadest type detection
@@ -352,8 +373,45 @@ each file is counted once:
 | Still locked (need a key) | intact, but no key found yet; a new or different key is the usual reason |
 | Had a problem | something else, such as a disk or permission error; the reason is printed |
 
-Press Ctrl+C at any time to pause. Use `--verbose` for technical detail and
-`--quiet` for the minimum. `--file-list FILE` works on just the paths in FILE.
+The window shows the same report: the verdict (for example `PARTLY
+RECOVERED`) and the four counts under **Current method** on the Run tab, and
+the full text under **Output**. **Open output folder** takes you to the
+recovered copies.
+
+To stop a search early, press **Stop and recover what is matched** in the
+window (or Ctrl+C on the command line, then choose 2). Every file already
+matched to a key is still written. **Force stop** ends at once and recovers
+nothing from that run; your encrypted files are unaffected either way. On the
+command line, `--verbose` gives technical detail and `--quiet` the minimum,
+and `--file-list FILE` works on just the paths in FILE.
+
+---
+
+## The window's settings and safety limits
+
+**Settings** tab:
+
+- **Engine.** "built-in" is the engine inside the program and the right choice
+  almost always. To try another version, choose an unmicro release file or
+  `unmicro.py` instead. Version, Self-test and GPU info run the engine's own
+  checks.
+- **Safety limits**, used by the search mode "Run until this machine cannot
+  take it any more" (Search tab). That mode uses every core with no guess
+  limit until the search space runs out, which for long keys is never, so it
+  warns first with an estimated time to failure. While it runs, the program
+  checks the CPU temperature, memory use, free disk on the output drive and
+  the battery every 5 seconds. If one stays past its limit for 30 seconds, it
+  stops the search cleanly and recovers every matched file, and the progress
+  file lets a later run continue. Defaults: 95 °C, 92 % memory, 2 GB free
+  disk, 15 % battery (only counted on battery). Where the machine gives no
+  temperature reading (often Windows without admin rights, and macOS),
+  overheating is left to the hardware's own protection.
+- **Profiles.** Settings are saved when the window closes. Save or load a
+  named profile per case; a saved profile never includes the licence.
+
+Settings live in `%APPDATA%\unmicro-gui` on Windows,
+`~/Library/Application Support/unmicro-gui` on macOS and
+`~/.config/unmicro-gui` on Linux.
 
 ## What it will and will not do to your files
 
@@ -624,10 +682,11 @@ each work item turns its own index into a candidate, builds the key, decrypts,
 and checks the result. Nothing but the rare hit crosses the bus, so it runs at
 the card's speed. One OpenCL kernel covers both NVIDIA and AMD.
 
-**Run it from the Python source, not the released `.exe`.** The GPU needs
-`pyopencl` and your GPU's OpenCL runtime, which the standalone binary does not
-bundle (and most victim machines do not have). GPU is the operator's cracking
-path:
+**Run it from the Python source, not the downloads.** The GPU needs
+`pyopencl` and your GPU's OpenCL runtime, which the downloads do not bundle
+(and most victim machines do not have). GPU is the operator's cracking path.
+From source, the window's "Use the graphics card" switch (Search tab) works
+too, once `pyopencl` is installed:
 
 ```
 pip install pyopencl numpy      # plus your NVIDIA or AMD OpenCL runtime
@@ -658,6 +717,18 @@ a self-test failure instead, it has already fallen back to the CPU; please
 report the device.
 
 ## Options worth knowing
+
+The program itself:
+
+| flag | effect |
+| --- | --- |
+| (none) | open the window (the first start asks: modern or classic) |
+| `--qt` / `--tk` | open the modern or the classic window this time |
+| `--choose` | ask again which window to use, and remember the answer |
+| `--cli [options]` | the engine's command line, with every option below |
+| `--version` | print the version |
+
+The engine's options, after `--cli` (or after `python3 unmicro.py`):
 
 | flag | effect |
 | --- | --- |
@@ -699,6 +770,35 @@ report the device.
 MAGPIES is Rho-9's category noun for financially motivated extortion crews.
 Delivery has been observed through trojanized Minecraft mods in CurseForge
 packs, and through files posing as games.
+
+## Building and releasing (maintainers)
+
+Releases are built by GitHub Actions (`.github/workflows/build.yml`) on
+Ubuntu 22.04 (for glibc 2.35) and Windows, with every Python package pinned by
+hash in `requirements-build.txt` and every action pinned to a commit. Each
+build runs the tests, builds the one-file program with PyInstaller
+(`packaging/unmicro.spec`, UPX off), checks the engine through `--cli
+--self-test`, opens and closes both windows, and on Windows checks the hidden
+console the window gives the engine.
+
+To release, bump `VERSION` in `unmicro.py` and `__version__` in
+`unmicro_app/__init__.py` (a test keeps them equal), add a CHANGELOG entry and
+merge to `main`. If the tag `v<VERSION>` does not exist yet, the workflow
+creates it and publishes the release: `unmicro-<version>-windows-x86_64.exe`,
+`unmicro-<version>-linux-x86_64`, `SHA256SUMS` and build provenance. Pushing a
+`v*` tag by hand releases that tag.
+
+To build locally (on Windows for the Windows file):
+
+```
+pip install --require-hashes --only-binary=:all: -r requirements-build.txt
+python -m unittest discover -s tests
+python packaging/make_assets.py
+pyinstaller --noconfirm --clean packaging/unmicro.spec     # -> dist/unmicro(.exe)
+```
+
+To update the pinned packages, edit `packaging/build.in` and regenerate
+`requirements-build.txt` with the `uv pip compile` command at the top of it.
 
 ## Getting help
 

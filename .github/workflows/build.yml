@@ -316,10 +316,10 @@ jobs:
           `__WIN__ --cli --auto --out recovered` (it opens its own console
           window), or `./__LIN__ --cli --auto --out recovered`.
 
-          Each build needs its own license key. If you do not have one, email
-          **recon@rho-9.com** and mention "Chattering Magpies". Rho-9 sends one
-          back once your case is confirmed. Keys from earlier builds will not
-          work here.
+          You need a license key: paste it on the Keys tab (or pass `--license`
+          on the command line). If you do not have one, or yours is not
+          accepted, email **recon@rho-9.com** and mention "Chattering Magpies".
+          Rho-9 sends one back once your case is confirmed.
 
           Your encrypted files are never modified, renamed or deleted.
           Keep them until you have opened the recovered copies and are
