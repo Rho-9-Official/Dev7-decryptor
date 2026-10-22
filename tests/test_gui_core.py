@@ -234,7 +234,8 @@ class Shared(unittest.TestCase):
         self.assertIn('UNTIL THE MACHINE CANNOT TAKE IT', rows['Search'])
         self.assertEqual(rows['Machine'], 'all 8 cores')
         cmd = g.command_preview(g.Engine('/x/unmicro'), s)
-        self.assertTrue(cmd.startswith('UNMICRO_LICENSE=\u2026 /x/unmicro'))
+        hint = 'set UNMICRO_LICENSE=\u2026 && ' if g.WINDOWS else 'UNMICRO_LICENSE=\u2026 '
+        self.assertTrue(cmd.startswith(hint + '/x/unmicro'), cmd)
         self.assertNotIn(' K ', cmd + ' ')
         self.assertIn('<file list>', g.command_preview(g.Engine('/x/unmicro'), cfg(paths=['/a', '/b'])))
         builtin = g.command_preview(g.Engine(g.BUILTIN), s)
