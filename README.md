@@ -12,8 +12,9 @@ the ones renamed to `.cryptedmicro`.
 
 > **Warning: 5.0 is experimental and may contain bugs.** It is the first
 > release as one program (the window with the engine built in).
-> **Linux (x86_64) and Windows 10 (64-bit) were both tested end to end**,
-> including recovery, stop-and-recover and the safety limits. Other systems
+> **Linux (x86_64) and Windows 10 (64-bit) were both tested end to end**, on
+> machines with no Python installed, including recovery, stop-and-recover and
+> the safety limits. Other systems
 > (Windows 11, other Linux distributions) are expected to work but have not
 > been tested. Whatever happens, your encrypted files are only ever read,
 > never changed. If something goes wrong, email recon@rho-9.com with what you
@@ -610,6 +611,10 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Stop without Ctrl+C (5.0.2).** The window's Stop, and the safety limits,
+  now ask the engine to stop directly instead of sending it Ctrl+C, the same
+  on every platform. Both downloads were tested on machines with no Python
+  installed.
 - **Windows fixes (5.0.1).** On Windows, "Stop and recover what is matched"
   (and the safety limits) ended the search without recovering anything; it
   now pauses and recovers every matched file, as on Linux. The progress file

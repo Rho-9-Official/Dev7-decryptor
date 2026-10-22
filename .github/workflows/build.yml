@@ -297,7 +297,8 @@ jobs:
           renamed to `.cryptedmicro`.
 
           > **Warning: this release is experimental and may contain bugs.**
-          > Linux (x86_64) and Windows 10 (64-bit) were both tested end to end;
+          > Linux (x86_64) and Windows 10 (64-bit) were both tested end to end,
+          > with no Python installed;
           > other systems are expected to work but have not been tested. Your
           > encrypted files are only ever read, never changed. Report problems
           > to recon@rho-9.com.

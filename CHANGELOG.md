@@ -2,7 +2,23 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
-## 5.0.1
+## 5.0.2
+
+### Changed
+- **Stop no longer uses Ctrl+C.** The window's "Stop and recover what is
+  matched", and a safety limit in the endless mode, ask the built-in engine to
+  stop through a stop file. It stops at the end of the current batch and
+  recovers every file already matched, the same on Windows, Linux and macOS,
+  with no pause menu and no console signalling. An engine chosen separately on
+  Settings (an older release, or unmicro.py) is still sent Ctrl+C, and `--cli`
+  keeps Ctrl+C for people at the keyboard.
+- Code notes describe how the engine is run and stopped.
+
+### Tested
+- Both downloads were tested end to end on machines with no Python
+  installed: Windows 10 (64-bit) and a plain Ubuntu 24.04 with only a
+  desktop's libraries.
+
 
 Windows fixes, found testing 5.0 on a real Windows 10 machine.
 
