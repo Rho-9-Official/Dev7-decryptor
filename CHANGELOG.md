@@ -6,6 +6,10 @@ All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
 One program per platform: a window with the engine built in.
 
+**Experimental: may contain bugs.** Linux (x86_64) is the platform known to be
+stable (tested end to end). The Windows build is smoke-tested by CI but not
+yet tested on a real Windows machine.
+
 ### Added
 - **The window** (`unmicro_app`): Files, Keys, Search, Output and Run tabs,
   plus Settings and Help. It builds the command line from those choices,

@@ -296,6 +296,12 @@ jobs:
           Free decryptor for the **Dev7 / Micro** ransomware family, the files
           renamed to `.cryptedmicro`.
 
+          > **Warning: this release is experimental and may contain bugs.**
+          > **Linux (x86_64) is the platform known to be stable** (tested end
+          > to end). The Windows build is smoke-tested here but has not yet
+          > been tested on a real Windows machine. Your encrypted files are
+          > only ever read, never changed. Report problems to recon@rho-9.com.
+
           Actor: **Chattering Magpies** (R9-C001). Malware self-name: Micro.
           Family: Dev7.
 

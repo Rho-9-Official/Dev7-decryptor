@@ -10,6 +10,15 @@ https://throne.com/rho-9-official
 Free decryptor for files encrypted by the **Dev7 / Micro** ransomware family,
 the ones renamed to `.cryptedmicro`.
 
+> **Warning: 5.0 is experimental and may contain bugs.** It is the first
+> release as one program (the window with the engine built in).
+> **Linux (x86_64) is the platform known to be stable:** its build was tested
+> end to end, including recovery, stop-and-recover and the safety limits.
+> **Windows** is built and smoke-tested automatically, but has not yet been
+> tested on a real Windows machine. Whatever happens, your encrypted files
+> are only ever read, never changed. If something goes wrong, email
+> recon@rho-9.com with what you saw.
+
 Built and maintained by **Rho-9 Systems**. Your first line of unusual defense.
 
 This tool is free and will stay free.
