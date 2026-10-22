@@ -1304,8 +1304,8 @@ def run_gui():
             V['engine'].set(os.path.normpath(p))
             check_engine()
     c.addLayout(hbox((entry(V['engine'], mono=True), 1), Btn('Browse…', browse_engine, 'ghost', small=True),
-                     Btn('Find automatically', lambda: (V['engine'].set(''), check_engine()), 'ghost', small=True)))
-    c.addWidget(lbl('The release binary for this system (unmicro-<version>-windows-x86_64.exe or -linux-x86_64), or unmicro.py. Only use a copy downloaded from the Rho-9-Official GitHub repository, with its checksum verified.', 'faint', wrap=True))
+                     Btn('Use the built-in engine', lambda: (V['engine'].set(''), check_engine()), 'ghost', small=True)))
+    c.addWidget(lbl('"built-in" is the engine inside this program, and the right choice almost always. To test another version, choose an unmicro release binary or unmicro.py instead. Only use a copy downloaded from the Rho-9-Official GitHub repository, with its checksum verified.', 'faint', wrap=True))
     c.addLayout(hbox(lbl('Python for unmicro.py (blank = this one)', 'muted'), None, entry(V['python'], width=340, mono=True)))
     eng_out = lbl('', 'muted', wrap=True, sel=True)
     c.addWidget(eng_out)
@@ -1435,14 +1435,14 @@ def run_gui():
 
     def check_engine():
         e = engine()
-        if not e.path or not os.path.exists(e.path):
+        if not e.available():
             cands = Engine.candidates()
             if cands:
                 V['engine'].set(cands[0])
                 e = engine()
-        if not e.path or not os.path.exists(e.path):
+        if not e.available():
             set_engine_chip('not found', C['danger'])
-            eng_out.setText('No unmicro found. Put the binary next to this program, or choose it with Browse.')
+            eng_out.setText('No engine found. Press "Use the built-in engine", or choose an unmicro binary with Browse.')
             set_color(eng_out, C['danger'])
             return
 
@@ -1528,7 +1528,7 @@ def run_gui():
         e = engine()
         cmd_box.setPlainText(command_preview(e, s))
         if not (state['job'] and state['job'].running()):
-            start_btn.set_enabled(not probs and bool(e.path))
+            start_btn.set_enabled(not probs and e.available())
 
     # ---------- running -----------
     def start_run():
@@ -1538,7 +1538,7 @@ def run_gui():
             message('Not ready yet', '\n'.join(probs))
             return
         e = engine()
-        if not e.path or not os.path.exists(e.path):
+        if not e.available():
             message('No engine', 'Choose the unmicro program on the Settings tab.', 'danger')
             show('settings')
             return

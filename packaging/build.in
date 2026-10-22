@@ -1,0 +1,6 @@
+pyinstaller==6.22.3
+pycryptodome==3.23.0
+filetype==1.2.0
+PySide6-Essentials==6.12.0
+pillow==13.0.0
+psutil

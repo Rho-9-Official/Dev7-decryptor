@@ -4,12 +4,20 @@
 
 Falls back to the Tk UI when PySide6 is not installed. Run it with --choose
 to see the menu again, or --qt / --tk to pick for this start only. This is
-the program's entry point (python -m unmicro_app, and the built exe).
+the program's entry point (python -m unmicro_app, and the built exe), and it
+also runs the built-in engine: --cli for the command line, --engine for the
+GUI's own runs.
 """
 import os
 import sys
 
-from .core import C, APP_VERSION, config_dir, helper_main, load_config, save_config
+from .core import (C, APP_VERSION, WINDOWS, builtin_available, config_dir, helper_main, load_config, run_engine,
+                   save_config, win_std_streams)
+
+
+def engine_version():
+    import unmicro
+    return unmicro.VERSION
 
 
 def qt_available():
@@ -73,12 +81,23 @@ def choose(current):
 
 
 def main(argv=None):
+    # The engine's worker processes start as copies of the built exe; this
+    # turns such a copy into a worker (and does nothing otherwise).
+    import multiprocessing
+    multiprocessing.freeze_support()
     argv = sys.argv[1:] if argv is None else argv
-    rc = helper_main(argv)  # Windows console helper modes: whichever UI started us needs them
+    rc = helper_main(argv)  # Windows console helper modes
     if rc is not None:
         return rc
+    if argv[:1] in (['--engine'], ['--cli']):
+        # --engine: the GUI running the built-in engine. --cli: a person who
+        # wants the command line (its own console window on Windows when
+        # nothing is redirected).
+        if WINDOWS:
+            win_std_streams(own_console=argv[0] == '--cli')
+        return run_engine(argv[1:])
     if argv[:1] in (['--version'], ['-V']):
-        print('unmicro GUI %s' % APP_VERSION)
+        print('unmicro GUI %s%s' % (APP_VERSION, (', engine %s' % engine_version()) if builtin_available() else ''))
         return 0
     cfg_path = os.path.join(config_dir(), 'settings.json')
     cfg = load_config(cfg_path)

@@ -7,7 +7,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from unmicro_app import __version__  # noqa: E402
+from unmicro import VERSION as __version__  # noqa: E402  (the release version is the engine's)
 from unmicro_app.core import BIRD_EYE, C, bird_polygon  # noqa: E402
 
 OUT = os.path.join(ROOT, 'build', 'assets')
@@ -38,8 +38,8 @@ def version_info(path):
       StringStruct('CompanyName', 'Rho-9 Systems'),
       StringStruct('FileDescription', 'unmicro - Dev7 / Micro decryptor'),
       StringStruct('FileVersion', '%(v)s'),
-      StringStruct('InternalName', 'unmicro-gui'),
-      StringStruct('OriginalFilename', 'unmicro-gui.exe'),
+      StringStruct('InternalName', 'unmicro'),
+      StringStruct('OriginalFilename', 'unmicro.exe'),
       StringStruct('ProductName', 'unmicro'),
       StringStruct('ProductVersion', '%(v)s')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
@@ -54,4 +54,4 @@ if __name__ == '__main__':
     os.makedirs(OUT, exist_ok=True)
     icon(os.path.join(OUT, 'unmicro.ico'))
     version_info(os.path.join(OUT, 'version_info.txt'))
-    print('assets for unmicro GUI %s in %s' % (__version__, OUT))
+    print('assets for unmicro %s in %s' % (__version__, OUT))

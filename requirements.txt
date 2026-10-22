@@ -1,0 +1,23 @@
+# unmicro runtime dependencies.
+#
+# The tool is written to run on a bare Python 3.7+ interpreter: a complete
+# AES-256 implementation is built in, and the extension-repair step falls back
+# to an internal signature table. These packages are the fast/broad path, and
+# are what the released binaries are built with.
+
+# Content-based file type detection, used to repair extensions the Dev7 crew
+# randomised before encrypting (a video named .jpg, an archive named .png).
+# Pure Python, no sub-dependencies, so it bundles into the frozen binary and
+# installs on Termux with a single pip. Without it, unmicro falls back to its
+# smaller built-in table and says so.
+filetype>=1.2.0
+
+# Compiled AES back end. Optional but strongly recommended before --brute; the
+# pure-Python fallback is thousands of times slower. unmicro also accepts
+# "cryptography" if that is what you have installed instead.
+pycryptodome>=3.19.0
+
+# Optional GPU acceleration for the sweep (--gpu), OpenCL, covers NVIDIA and
+# AMD. Needs a working OpenCL runtime for your GPU as well. Uncomment to use:
+# pyopencl>=2023.1
+# numpy>=1.21

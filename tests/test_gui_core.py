@@ -237,6 +237,10 @@ class Shared(unittest.TestCase):
         self.assertTrue(cmd.startswith('UNMICRO_LICENSE=\u2026 /x/unmicro'))
         self.assertNotIn(' K ', cmd + ' ')
         self.assertIn('<file list>', g.command_preview(g.Engine('/x/unmicro'), cfg(paths=['/a', '/b'])))
+        builtin = g.command_preview(g.Engine(g.BUILTIN), s)
+        self.assertIn('python -m unmicro_app --cli', builtin)
+        self.assertNotIn('--engine', builtin)
+        self.assertEqual(g.Engine(g.BUILTIN).argv(['--version'])[-2:], ['--engine', '--version'])
 
     def test_estimate_table(self):
         head, rows, foot = g.estimate_table(dict(g.DEFAULTS), cfg(charset='observed', workers=0, gpu=False), 4)
@@ -273,22 +277,6 @@ class Shared(unittest.TestCase):
         c = {}
         g.record_speed(c, [100.0, 300.0, 200.0], 4, False)
         self.assertEqual(c['measured']['per_worker'], 50.0)
-
-    def test_bundled_engine_path_not_saved(self):
-        import json
-        import tempfile
-        d = tempfile.mkdtemp()
-        sys._MEIPASS = os.path.join(d, '_MEI1')
-        try:
-            path = os.path.join(d, 's.json')
-            g.save_config(path, {'engine': os.path.join(sys._MEIPASS, 'engine', 'unmicro'), 'license': 'K'})
-            saved = json.load(open(path))
-            self.assertEqual(saved['engine'], '')
-            self.assertEqual(saved['license'], '')
-            g.save_config(path, {'engine': '/opt/unmicro'})
-            self.assertEqual(json.load(open(path))['engine'], '/opt/unmicro')
-        finally:
-            del sys._MEIPASS
 
     def test_bird_polygon(self):
         pts = g.bird_polygon(2.0, 1.0, 1.0)

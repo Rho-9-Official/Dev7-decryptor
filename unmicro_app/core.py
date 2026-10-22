@@ -62,14 +62,112 @@ DEFAULT_GPU_RATE = 3.0e8
 
 
 # --------------------------------------------------------------------------
+# The built-in engine. unmicro.py ships inside this program: the GUI runs a
+# copy of the program with --engine, and people who want the command line
+# run it with --cli.
+# --------------------------------------------------------------------------
+
+BUILTIN = 'built-in'
+PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def builtin_available():
+    """True when unmicro.py is part of this program (always in the built
+    exe; from source when unmicro.py sits next to the unmicro_app folder)."""
+    if not getattr(sys, 'frozen', False) and os.path.isfile(os.path.join(PKG_PARENT, 'unmicro.py')) \
+            and PKG_PARENT not in sys.path:
+        sys.path.insert(0, PKG_PARENT)
+    try:
+        import importlib.util
+        return importlib.util.find_spec('unmicro') is not None
+    except Exception:
+        return False
+
+
+def self_cmd():
+    """How to start another copy of this program. Every entry point (the
+    built exe, python -m unmicro_app) runs launcher.main(), which handles
+    --engine, --cli and the console helper modes before anything else."""
+    if getattr(sys, 'frozen', False):
+        return [sys.executable]
+    return [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv.pop(1)); '
+            'from unmicro_app.launcher import main; sys.exit(main())', PKG_PARENT]
+
+
+def run_engine(args):
+    """Run the built-in engine exactly as the standalone unmicro binary
+    did: the same console set-up, error report and window hold."""
+    import traceback
+    import unmicro
+    unmicro.setup_console()
+    hold = unmicro.launched_by_double_click()
+    sys.argv = [sys.argv[0]] + list(args)  # main() reads sys.argv (and opens its menu when there are none)
+    try:
+        code = unmicro.main()
+    except KeyboardInterrupt:
+        sys.stderr.write('\ninterrupted, nothing left half written\n')
+        code = 130
+    except SystemExit as ex:  # argparse: --help, --version, bad options
+        code = ex.code if isinstance(ex.code, int) else (0 if ex.code is None else 1)
+    except Exception:
+        traceback.print_exc()
+        print('\nunmicro stopped on an unexpected error. Please send the text above')
+        print('to %s and mention Chattering Magpies.' % CONTACT)
+        code = 1
+    if hold:
+        unmicro.pause_before_close()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    return code
+
+
+def win_std_streams(console_in=False, own_console=False):
+    """Windows only. A windowed program has no console and may have no
+    sys.stdout. own_console: open a console window when nothing was
+    redirected (unmicro.exe --cli started from Explorer or cmd).
+    console_in: read stdin from this process's console (--engine under the
+    hidden console the GUI made)."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.GetStdHandle.restype = wintypes.HANDLE
+
+    def usable(h):
+        return bool(h) and h != wintypes.HANDLE(-1).value and k32.GetFileType(wintypes.HANDLE(h)) != 0
+    out, err = k32.GetStdHandle(-11), k32.GetStdHandle(-12)
+    if own_console and not usable(out):
+        if not k32.AttachConsole(-1):  # ATTACH_PARENT_PROCESS: works when a console started us
+            k32.AllocConsole()
+        sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
+        sys.stderr = sys.stdout
+        sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+        return
+    for name, h in (('stdout', out), ('stderr', err)):
+        if getattr(sys, name) is None and usable(h):
+            fd = msvcrt.open_osfhandle(h, os.O_WRONLY)
+            setattr(sys, name, open(fd, 'w', encoding='utf-8', errors='replace', buffering=1, closefd=False))
+    if console_in:
+        sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
+
+
+# --------------------------------------------------------------------------
 # Windows console helpers. These run in a separate copy of this program
 # (started with --console-host / --console-send) so the GUI's own process
 # never has to attach to, or free, a console.
 # --------------------------------------------------------------------------
 
+PIDFILE_ENV = 'UNMICRO_CONSOLE_PIDFILE'
+
+
 def _console_host(argv):
     """Run argv on this (hidden) console with stdin = the console, so the
-    binary sees a terminal. stdout/stderr are the pipes the GUI gave us."""
+    engine sees a terminal. stdout/stderr are the pipes the GUI gave us.
+    The built-in engine (this program with --engine) runs right here, in
+    this process, so it is the one attached to the console."""
     import signal
     import ctypes
     from ctypes import wintypes
@@ -87,6 +185,20 @@ def _console_host(argv):
             ctypes.windll.user32.ShowWindow(hwnd, 0)
         k32.SetStdHandle(-11, wintypes.HANDLE(hout))
         k32.SetStdHandle(-12, wintypes.HANDLE(herr))
+    # The GUI sends Ctrl+C and keystrokes by attaching to a process on this
+    # console. In the one-file exe the process it started is PyInstaller's
+    # launcher, which is not on the console, so say which one is.
+    pidfile = os.environ.pop(PIDFILE_ENV, None)
+    if pidfile:
+        try:
+            with open(pidfile, 'w') as fh:
+                fh.write(str(os.getpid()))
+        except OSError:
+            pass
+    me = self_cmd()
+    if argv[:len(me)] == me and argv[len(me):len(me) + 1] == ['--engine']:
+        win_std_streams(console_in=True)
+        return run_engine(argv[len(me) + 1:])
     conin = open('CONIN$', 'rb')
     child = subprocess.Popen(argv, stdin=conin)
     # Ctrl+C sent to the console reaches us too; only the child may act on it.
@@ -135,17 +247,6 @@ def _console_send(pid, action, text=''):
         return 4
     finally:
         k32.FreeConsole()
-
-
-def _helper_cmd():
-    """How to start a copy of this program in a helper mode. Every entry
-    point (the built exe, python -m unmicro_app, either UI's main) hands the
-    helper modes to helper_main() before anything else."""
-    if getattr(sys, 'frozen', False):
-        return [sys.executable]
-    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv.pop(1)); '
-            'from unmicro_app.core import helper_main; sys.exit(helper_main())', pkg_parent]
 
 
 # --------------------------------------------------------------------------
@@ -631,7 +732,11 @@ def command_preview(engine, s):
     environment variable with its value elided, never on the command line."""
     args = build_args(s, '<file list>' if s['source'] == 'folders' and len(s['paths']) > 1 else None)
     env_hint = ('set %s=\u2026 && ' % LICENSE_ENV) if WINDOWS else ('%s=\u2026 ' % LICENSE_ENV)
-    return env_hint + ' '.join(quote_arg(x) for x in engine.argv(args))
+    if engine.path == BUILTIN:  # the form a person can run, not the GUI's internal --engine
+        cmd = ([sys.executable] if getattr(sys, 'frozen', False) else ['python', '-m', 'unmicro_app']) + ['--cli'] + args
+    else:
+        cmd = engine.argv(args)
+    return env_hint + ' '.join(quote_arg(x) for x in cmd)
 
 
 def schedule_tone(cum_secs):
@@ -1089,13 +1194,21 @@ class Resources(object):
 # --------------------------------------------------------------------------
 
 class Engine(object):
-    """Where the unmicro binary (or unmicro.py) is, and how to start it."""
+    """Which unmicro engine runs, and how to start it: the built-in one
+    (BUILTIN), or a separate unmicro binary or unmicro.py chosen on Settings."""
 
     def __init__(self, path='', python=''):
         self.path = path
         self.python = python
 
+    def available(self):
+        if self.path == BUILTIN:
+            return builtin_available()
+        return bool(self.path) and os.path.exists(self.path)
+
     def argv(self, args):
+        if self.path == BUILTIN:
+            return self_cmd() + ['--engine'] + list(args)
         if self.path.lower().endswith('.py'):
             py = self.python or (sys.executable if not getattr(sys, 'frozen', False) else ('py' if WINDOWS else 'python3'))
             if WINDOWS and os.path.basename(py).lower() == 'pythonw.exe':
@@ -1106,9 +1219,7 @@ class Engine(object):
     @staticmethod
     def candidates():
         here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
-        # a copy bundled inside the one-file exe comes first
-        bundled = [os.path.join(sys._MEIPASS, 'engine')] if hasattr(sys, '_MEIPASS') else []
-        dirs = bundled + [here, os.path.join(here, 'engine'), os.getcwd(), os.path.expanduser('~/tools'),
+        dirs = [here, os.path.join(here, 'engine'), os.getcwd(), os.path.expanduser('~/tools'),
                 os.path.expanduser('~/Downloads'), os.path.expanduser('~/Desktop')]
         pats = (re.compile(r'^unmicro-[\d.]+-windows-x86_64\.exe$', re.I) if WINDOWS else re.compile(r'^unmicro-[\d.]+-linux-x86_64$'),
                 re.compile(r'^unmicro(\.exe)?$', re.I), re.compile(r'^unmicro\.py$'))
@@ -1126,7 +1237,10 @@ class Engine(object):
         w = shutil.which('unmicro')
         if w and w not in found:
             found.append(w)
-        return found
+        # never this program itself (its file is named like a release engine)
+        me = os.path.abspath(sys.executable)
+        found = [p for p in found if os.path.abspath(p) != me]
+        return ([BUILTIN] if builtin_available() else []) + found
 
     def quick(self, args, env=None, timeout=120):
         """Run a short command (version, self-test, list keys) and return
@@ -1168,7 +1282,10 @@ class Job(object):
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = 0  # SW_HIDE
-            self.proc = subprocess.Popen(_helper_cmd() + ['--console-host'] + self.argv,
+            fd, self.pidfile = tempfile.mkstemp(prefix='unmicro-console-', suffix='.pid')
+            os.close(fd)
+            self.env[PIDFILE_ENV] = self.pidfile
+            self.proc = subprocess.Popen(self_cmd() + ['--console-host'] + self.argv,
                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          env=self.env, cwd=self.cwd, startupinfo=si,
                                          creationflags=0x00000010)  # CREATE_NEW_CONSOLE
@@ -1218,6 +1335,11 @@ class Job(object):
 
     def _wait(self):
         rc = self.proc.wait()
+        if getattr(self, 'pidfile', None):
+            try:
+                os.unlink(self.pidfile)
+            except OSError:
+                pass
         for t in self._readers:
             t.join(5)
         if self.master is not None:
@@ -1268,9 +1390,18 @@ class Job(object):
             except OSError:
                 self.proc.kill()
 
+    def console_pid(self):
+        """The process on the hidden console (written by the console host);
+        the started process until it has said."""
+        try:
+            with open(self.pidfile) as fh:
+                return int(fh.read().strip())
+        except (AttributeError, OSError, ValueError):
+            return self.proc.pid
+
     def _win_send(self, action, text=''):
         try:
-            rc = subprocess.call(_helper_cmd() + ['--console-send', str(self.proc.pid), action, text],
+            rc = subprocess.call(self_cmd() + ['--console-send', str(self.console_pid()), action, text],
                                  creationflags=0x08000000, timeout=20)
             return rc == 0
         except Exception:
@@ -1331,11 +1462,6 @@ def save_config(path, cfg):
     data = dict(cfg)
     if not data.get('remember_license'):
         data['license'] = ''
-    # an engine bundled in the one-file exe lives in a temporary folder that
-    # changes every start: found again each time, never saved
-    meipass = getattr(sys, '_MEIPASS', None)
-    if meipass and os.path.abspath(data.get('engine') or '').startswith(os.path.abspath(meipass) + os.sep):
-        data['engine'] = ''
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp'

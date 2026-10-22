@@ -1,5 +1,6 @@
 # CI smoke test: run inside the built program through UNMICRO_GUI_TEST_HOOK.
-# It writes what started to $SMOKE_OUT, then closes the window.
+# It writes what started, and which engine it picked, to $SMOKE_OUT, then
+# closes the window.
 import os
 kind = 'qt' if 'QtWidgets' in globals() else 'tk'
 
