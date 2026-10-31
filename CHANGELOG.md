@@ -2,6 +2,84 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 5.2.0
+
+The goal of this release is speed without losing anything: every faster path
+gives the same answers as the one it replaced, and is checked against it.
+
+### Added
+- **The GCM files get every method the older files get.** After everything
+  else, the fitted model (`--brute`) and the structural brute
+  (`--dumb-brute`) now run on the GCM files that are still locked. Before,
+  those two were left to the older files only. They are resumable with
+  `--checkpoint`, and a structural length that would take more than half an
+  hour at the measured GCM speed asks first, in the same words as the older
+  files' gate, so the window answers it the same way. Under the full-auto
+  default they run on the GCM files only when no key has opened anything yet,
+  so matched files are not held back, and the fitted model asks first there,
+  since on these files it never runs out. Block-aligned files that stayed
+  locked join them only when the machine shows the newer attack at all, so an
+  older-format case with an unknown key does not spend hours in the GCM
+  search.
+- **`--checkpoint` covers the GCM sweeps.** They save after every chunk to
+  `FILE.gcm`, one entry per set of files, so the quick sweep and the later
+  open-ended one keep separate places and resuming one never loses the
+  other. A saved place is never past a guess that was not checked (a pause's
+  cut guesses hold it back).
+- `tests/bench_speed.py`: prints the speed of each hot path (`--gpu` for the
+  kernels), to compare builds on one machine.
+- `tests/test_speed_parity.py`: each speed-up against the code it replaced,
+  the new GCM methods, checkpoint and gate, and the GPU pipeline through
+  pauses, a lost device and `--max-candidates`.
+
+### Changed (faster)
+- **GCM key test by tag alone.** A guess is tested on a GCM file with GHASH
+  over the ciphertext and one AES block, without generating keystream or
+  plaintext. The libraries only expose GHASH through associated data, so the
+  ciphertext goes in as AAD and the length block is corrected with one field
+  multiplication. 16 MB probe: 3.1 ms instead of 10.7 (cryptography), 4.1
+  instead of 26 (pycryptodome). Used in the search and when mapping a found
+  key across files; writing still decrypts and verifies in full. Each back
+  end's tag-only check is compared with full GCM when it starts, and is turned
+  off (full decryption used) if they ever disagree; `--self-test` reports it.
+- **GPU and CPU overlap on the GCM files.** With `--gpu`, the next chunk's
+  keys are derived on a helper thread while the CPU checks the current
+  chunk's tags, both in the search and in mapping found keys. A pause, Stop or
+  lost device leaves nothing in flight. On a stand-in GPU with 11-20 MB
+  probes, the CPU side went from 99 to 266 guesses a second on 2 cores, so a
+  12-core machine should keep up with an RTX 3060.
+- **PBKDF2 kernel.** The round loop's SHA-256 is written for its one block
+  shape: padding words as constants, a 16-word rolling schedule instead of a
+  64-word array, all 64 rounds written out (generated in Python). Still checked
+  against hashlib before use. Not yet measured on a card.
+- **Older format, CPU sweep about 4 to 6 times faster per core.** All probe
+  blocks are decrypted in one call per guess, and the signature check looks
+  only at signatures that can match the block's first byte (same result as
+  before, checked over every signature).
+- **Older format, GPU kernels rewritten.** AES on 32-bit columns, S-boxes in
+  local memory, InvMixColumns by shifts and XORs instead of bit-by-bit field
+  multiplication, the key schedule once per guess for all probes, and the
+  word-list filter sends the keys once for every probe block. On pocl the
+  structural brute went from about 190,000 to 3.6 million guesses a second
+  and the word list from 41,000 to 590,000. The self-tests now also cover
+  several probe blocks in one launch.
+- **Older format, generation overlaps the checks.** The next chunk of
+  candidates is generated while the pool (or the GPU, on a helper thread)
+  checks this one.
+- The time the older files' gate quotes uses the new CPU speed.
+- GCM messages say the slow methods run on the GCM files last, and the "what
+  next" hint no longer leaves out `--dumb-brute` when every file is GCM.
+
+### Not changed
+- Probe choice (10 MB or more, spread across sizes and folders), the damaged
+  file screen, verification, output and the window.
+
+### Tested
+- The whole suite, with the GPU tests on pocl, and the licence-gated
+  end-to-end tests against stand-in tables.
+- Not yet on an NVIDIA or AMD card: the kernels' self-tests still guard
+  every run, and fall back to the CPU on any mismatch.
+
 ## 5.1.1
 
 ### Fixed

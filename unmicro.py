@@ -26,7 +26,7 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '5.1.1'
+VERSION = '5.2.0'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
 # Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the
@@ -404,8 +404,6 @@ def next_step_hint(brute, dumb_brute, any_ecb):
     """What to try next, in words, for files that no key has opened."""
     if not brute:
         return 'search harder. Run again at the Standard level (--brute), which also tries likely variations of the known keys.'
-    if not any_ecb:
-        return 'search a memory dump, pagefile or hibernation file for the key (--scavenge FILE), or supply a key you know (--key).'
     if not dumb_brute:
         return 'search harder. Run again at the Thorough level (--dumb-brute) and add --checkpoint FILE so a long run can resume.'
     return 'widen the search (--deep, --charset full), or search a memory dump for the key (--scavenge FILE).'
@@ -772,6 +770,13 @@ _dec_blocks = None
 # update(chunk) -> plaintext and verify() -> bool. Plaintext from update()
 # is never released by the callers below until verify() has passed.
 _gcm_new = None
+# _gcm_tag_new(key, iv) returns a tag-only GCM checker with update(chunk)
+# and tag() -> bytes: the tag the file would carry under that key. It runs
+# GHASH over the ciphertext and nothing else, no keystream and no plaintext,
+# which is all a key test needs. None until the back end is set up, and
+# None again if its self-check against full decryption ever disagrees, in
+# which case every caller falls back to decrypting and verifying in full.
+_gcm_tag_new = None
 
 
 class LicenseError(Exception):
@@ -803,7 +808,166 @@ class _LibGcm(object):
             return False
 
 
+def _gf128_mul(x, y):
+    """x times y in GF(2^128), GCM bit order, on 128-bit ints."""
+    z = 0
+    for i in range(127, -1, -1):
+        if (y >> i) & 1:
+            z ^= x
+        x = (x >> 1) ^ _GF_R if x & 1 else x >> 1
+    return z
+
+
+class _AadTag(object):
+    """GCM tag of a ciphertext under a key, from a library that only exposes
+    GHASH through the associated data. The ciphertext is fed in as AAD of an
+    empty message, so the library computes E(J0) xor GHASH(C, -) with the
+    lengths block reading len(A) = |C|, len(C) = 0, where the real tag has
+    len(A) = 0, len(C) = |C|. GHASH is linear, and the lengths block is the
+    last one hashed, so the two differ by exactly (L_real xor L_aad) * H, one
+    field multiplication, and H = E_K(0^128) is one AES block."""
+    __slots__ = ('_ctx', '_fin', '_h', '_n')
+
+    def __init__(self, ctx, fin, h):
+        self._ctx = ctx
+        self._fin = fin
+        self._h = h
+        self._n = 0
+
+    def update(self, data):
+        self._n += len(data)
+        if self._fin == 'cryptography':
+            self._ctx.authenticate_additional_data(data)
+        else:
+            self._ctx.update(data)
+
+    def tag(self):
+        if self._fin == 'cryptography':
+            self._ctx.finalize()
+            got = self._ctx.tag
+        else:
+            got = self._ctx.digest()
+        bits = (self._n * 8) & 0xFFFFFFFFFFFFFFFF
+        fix = _gf128_mul(bits ^ (bits << 64), int.from_bytes(self._h, 'big'))
+        return (int.from_bytes(got, 'big') ^ fix).to_bytes(16, 'big')
+
+
+class _PureGcmTag(object):
+    """Tag-only GCM on the built-in AES: GHASH over the ciphertext plus one
+    AES block for E(J0). Same interface as _AadTag; chunks a multiple of 16
+    bytes except the last."""
+
+    def __init__(self, key, iv):
+        if len(iv) != GCM_IV_LEN:
+            raise ValueError('this build expects a 12 byte GCM IV')
+        self._aes = _PureAES(key)
+        self._tbl = _ghash_tables(int.from_bytes(self._aes.keystream_block(b'\x00' * 16), 'big'))
+        self._iv = bytes(iv)
+        self._y = 0
+        self._n = 0
+
+    def update(self, data):
+        t = self._tbl
+        y = self._y
+        for i in range(0, len(data), 16):
+            yb = (y ^ int.from_bytes(data[i:i + 16].ljust(16, b'\x00'), 'big')).to_bytes(16, 'big')
+            y = 0
+            for p in range(16):
+                y ^= t[p][yb[p]]
+        self._y = y
+        self._n += len(data)
+
+    def tag(self):
+        yb = (self._y ^ (self._n * 8)).to_bytes(16, 'big')
+        s = 0
+        for p in range(16):
+            s ^= self._tbl[p][yb[p]]
+        ek = self._aes.keystream_block(self._iv + b'\x00\x00\x00\x01')
+        return bytes(a ^ b for a, b in zip(s.to_bytes(16, 'big'), ek))
+
+
+def _gcm_tag_selfcheck(factory):
+    """True when factory's tags equal what full GCM encryption produces, over
+    lengths either side of the block size and of the chunking. Run once when
+    the back end is set up; any disagreement turns the tag-only path off."""
+    try:
+        for n in (0, 1, 15, 16, 17, 31, 32, 33, 100, 4096, 4101):
+            key, iv = os.urandom(32), os.urandom(GCM_IV_LEN)
+            pt = os.urandom(n)
+            ct, want = _gcm_encrypt_ref(key, iv, pt)
+            for step in (n or 1, 16, 48):
+                t = factory(key, iv)
+                for i in range(0, len(ct), step):
+                    t.update(ct[i:i + step])
+                if not _hmac.compare_digest(t.tag(), want):
+                    return False
+            wrong = factory(os.urandom(32), iv)
+            wrong.update(ct)
+            if _hmac.compare_digest(wrong.tag(), want):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _gcm_encrypt_ref(key, iv, pt):
+    """(ciphertext, tag) of pt from the full GCM of the active back end, or
+    the built-in one, used only to check the tag-only path."""
+    if BACKEND == 'cryptography':
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        e = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
+        ct = e.update(pt) + e.finalize()
+        return (ct, e.tag)
+    if BACKEND == 'pycryptodome':
+        from Crypto.Cipher import AES as _AES
+        c = _AES.new(key, _AES.MODE_GCM, nonce=iv, mac_len=GCM_TAG_LEN)
+        ct, tag = c.encrypt_and_digest(pt)
+        return (ct, tag)
+    # Built-in: CTR from counter 2, then the tag through the decrypt path
+    # (which hashes ciphertext, so it gives the encrypt tag too).
+    aes = _PureAES(key)
+    out = bytearray()
+    for i in range(0, len(pt), 16):
+        ks = aes.keystream_block(iv + ((i // 16 + 2) & 0xFFFFFFFF).to_bytes(4, 'big'))
+        out.extend(a ^ b for a, b in zip(pt[i:i + 16], ks))
+    ct = bytes(out)
+    g = _PureGCM(key, iv, b'\x00' * 16)
+    g.update(ct)
+    s = g._gmul(g._y ^ (g._clen * 8)).to_bytes(16, 'big')
+    ek = aes.keystream_block(iv + b'\x00\x00\x00\x01')
+    return (ct, bytes(a ^ b for a, b in zip(s, ek)))
+
+
 def _init_backend(force_pure=False):
+    global _gcm_tag_new
+    _gcm_tag_new = None
+    _set_backend(force_pure)
+    tagger = _tag_factory()
+    if tagger is not None and _gcm_tag_selfcheck(tagger):
+        _gcm_tag_new = tagger
+
+
+def _tag_factory():
+    if BACKEND == 'cryptography':
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        def _tag(key, iv):
+            h = Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(b'\x00' * 16)
+            return _AadTag(Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor(), 'cryptography', h)
+        return _tag
+    if BACKEND == 'pycryptodome':
+        from Crypto.Cipher import AES as _AES
+
+        def _tag(key, iv):
+            h = _AES.new(key, _AES.MODE_ECB).encrypt(b'\x00' * 16)
+            return _AadTag(_AES.new(key, _AES.MODE_GCM, nonce=iv, mac_len=GCM_TAG_LEN), 'pycryptodome', h)
+        return _tag
+    if BACKEND == 'pure-python':
+        return _PureGcmTag
+    return None
+
+
+def _set_backend(force_pure=False):
     global BACKEND, _dec_blocks, _gcm_new
     if not force_pure:
         try:
@@ -1245,6 +1409,18 @@ def self_test():
                 print('  AES-GCM tag check (%s): FAIL (accepted a corrupted tag)' % label)
                 return 1
         print('  AES-GCM vector: OK  (back end and pure-python, corrupted tag rejected)')
+        # The tag-only key test (GHASH without the keystream), on the same
+        # vector, for the active back end and the built-in one.
+        if _gcm_tag_new is None and BACKEND != 'pure-python':
+            print('  AES-GCM tag-only check: FAIL (disagreed with full decryption, turned off)')
+            return 1
+        for label, factory in (('back end', _gcm_tag_new or _PureGcmTag), ('pure-python', _PureGcmTag)):
+            g = factory(k, iv)
+            g.update(c)
+            if g.tag() != t:
+                print('  AES-GCM tag-only check (%s): FAIL' % label)
+                return 1
+        print('  AES-GCM tag-only check: OK  (matches full decryption)')
     except Exception as exc:
         print('  AES-GCM self-test: FAIL (%s)' % exc)
         return 1
@@ -1287,6 +1463,27 @@ def identify_ex(head):
         if head[off:off + len(magic)] == magic:
             return (label, ext, len(magic) >= STRONG_MAGIC_BYTES)
     return (None, None, False)
+
+def _signature_buckets():
+    """identify_ex's table split by the block's first byte, for the sweep's
+    inner loop. Bucket b holds, in SIGNATURES order, every signature at
+    offset 0 that starts with b and every signature at another offset, so
+    the first match found in a bucket is the one identify_ex returns."""
+    buckets = []
+    for b in range(256):
+        buckets.append(tuple((off, magic, off + len(magic), (label, ext, len(magic) >= STRONG_MAGIC_BYTES))
+                             for off, magic, label, ext in SIGNATURES if off != 0 or magic[0] == b))
+    return tuple(buckets)
+_SIG_BUCKETS = _signature_buckets()
+_NO_MATCH = (None, None, False)
+
+def identify_fast(head):
+    """Same result as identify_ex on any non-empty head, about ten times
+    faster on a block that matches nothing, which is nearly every guess."""
+    for off, magic, end, res in _SIG_BUCKETS[head[0]]:
+        if head[off:end] == magic:
+            return res
+    return _NO_MATCH
 
 def _valid_png(pt):
     if len(pt) < 57 or not pt.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -1587,6 +1784,37 @@ def gcm_stream(path, size, iv, tag, dk, keep=True, sink=None):
     if not ctx.verify():
         return (None, 'AES-GCM tag mismatch, wrong key for this file')
     return (b''.join(out) if keep else b'', None)
+
+def gcm_key_opens(path, size, iv, tag, dk, body=None):
+    """True when derived key dk gives the file's GCM tag. This is the key
+    test: the tag-only path when the back end has one (GHASH over the
+    ciphertext, no keystream, no plaintext), else full decrypt-and-verify.
+    body, when given, is the file's ciphertext already in memory."""
+    if _gcm_new is None:
+        _init_backend()
+    if _gcm_tag_new is None:
+        if body is not None:
+            ctx = _gcm_new(dk, iv, tag)
+            ctx.update(body)
+            return ctx.verify()
+        return gcm_stream(path, size, iv, tag, dk, keep=False)[1] is None
+    t = _gcm_tag_new(dk, iv)
+    if body is not None:
+        t.update(body)
+    else:
+        remaining = size - GCM_OVERHEAD
+        try:
+            with open(long_path(path), 'rb') as fh:
+                fh.seek(GCM_SALT_LEN + GCM_IV_LEN)
+                while remaining > 0:
+                    chunk = _read_exact(fh, min(GCM_READ_CHUNK, remaining))
+                    if not chunk:
+                        return False
+                    remaining -= len(chunk)
+                    t.update(chunk)
+        except OSError:
+            return False
+    return _hmac.compare_digest(t.tag(), bytes(tag))
 
 def gcm_open_file(path, key_string, keep=True):
     try:
@@ -2304,14 +2532,16 @@ def confirm_key(key_string, path):
     pt, verified, _ = decrypt_file(path, key_string, verify=True)
     return pt is not None and verified
 _WORKER_PROBES = []
+_WORKER_BLOCKS = b''
 
 def _worker_init(probes, license_key=None):
     """Pool worker initializer. On Windows (spawn) the module is re-imported
     in each child with KNOWN_KEYS == None, so the license key is passed
     through initargs and the sealed blobs are re-unlocked per worker."""
-    global _WORKER_PROBES
+    global _WORKER_PROBES, _WORKER_BLOCKS
     _ignore_sigint()
     _WORKER_PROBES = probes
+    _WORKER_BLOCKS = b''.join(blk for blk, _ in probes)
     if BACKEND is None:
         _init_backend(False)
     if license_key and KNOWN_KEYS is None:
@@ -2325,11 +2555,22 @@ def _worker_init(probes, license_key=None):
             pass
 
 def _worker_chunk(chunk):
+    """The CPU sweep. All the probe blocks are decrypted in one call per
+    guess (ECB treats each block on its own), so a guess costs one cipher
+    set-up rather than one per probe; the result is the same as decrypting
+    them one at a time."""
     hits = []
+    probes = _WORKER_PROBES
+    blocks = _WORKER_BLOCKS
+    dec = _dec_blocks
+    ident = identify_fast
+    pad = b'\x00' * 32
     for cand in chunk:
-        kb = key_bytes(cand)
-        for blk, path in _WORKER_PROBES:
-            label, _, strong = identify_ex(_dec_blocks(kb, blk))
+        raw = cand.encode('utf-8')
+        kb = raw[:32] if len(raw) >= 32 else (raw + pad)[:32]
+        pt = dec(kb, blocks)
+        for i, (blk, path) in enumerate(probes):
+            label, _, strong = ident(pt[16 * i:16 * i + 16])
             if not label:
                 continue
             if strong or confirm_key(cand, path):
@@ -2460,19 +2701,28 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
             tier_start = tried
             confirmed = []
             rejected = 0
-            while True:
-                chunk = list(itertools.islice(gen, chunk_size))
-                if not chunk:
-                    break
+            chunk = list(itertools.islice(gen, chunk_size))
+            while chunk:
+                # The next chunk is generated while this one is checked (by
+                # the pool, or by the GPU on a helper thread), so the
+                # candidate generator and the checks overlap.
                 if gpu is not None:
-                    raw = gpu.filter_chunk(chunk, probes)
+                    bg = _Background()
+                    bg.start(gpu.filter_chunk, chunk, probes)
+                    try:
+                        nxt = list(itertools.islice(gen, chunk_size))
+                    finally:
+                        raw = bg.result()
                 elif pool:
                     slices = [chunk[i::workers] for i in range(workers)]
+                    job = pool.map_async(_worker_chunk, slices)
+                    nxt = list(itertools.islice(gen, chunk_size))
                     raw = []
-                    for hits in pool.imap_unordered(_worker_chunk, slices):
+                    for hits in job.get():
                         raw.extend(hits)
                 else:
                     raw = _worker_chunk(chunk)
+                    nxt = None
                 tried += len(chunk)
                 consumed += len(chunk)
                 for h in raw:
@@ -2492,6 +2742,7 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536, che
                     if not quiet:
                         STATUS.live_done()
                     return ([], tried)
+                chunk = nxt if nxt is not None else list(itertools.islice(gen, chunk_size))
             if not quiet:
                 note = ''
                 if rejected:
@@ -2642,10 +2893,8 @@ def _gcm_probe_opens(path, dk):
         psize = file_size(path)
         if psize is None:
             return False
-        return gcm_stream(path, psize, iv, tag, dk, keep=False)[1] is None
-    ctx = _gcm_new(dk, iv, tag)
-    ctx.update(body)
-    return ctx.verify()
+        return gcm_key_opens(path, psize, iv, tag, dk)
+    return gcm_key_opens(path, None, iv, tag, dk, body=body)
 
 def _gcm_worker_chunk(job):
     chunk, probe_paths = job
@@ -2676,25 +2925,140 @@ def _gcm_verify_chunk(job):
             break
     return hits
 
-def _gcm_gpu_chunk(gpu, chunk, probe_paths, pool, workers, should_stop=None):
+class _GpuAhead(object):
+    """Runs the GPU's key derivation for the next chunk on a helper thread
+    while the CPU checks the tags of this one, so neither waits on the other.
+    The OpenCL calls release the GIL, and only one derivation is ever in
+    flight, so the device is never used from two threads at once. wait() is
+    called before anything else touches the GPU."""
+
+    def __init__(self, gpu):
+        self.gpu = gpu
+        self._thread = None
+        self._box = None
+        self._cancel = None
+
+    def start(self, cands, salts):
+        """Derive keys for cands under each salt in salts (one list per
+        salt, None for a salt that is None) in the background."""
+        import threading
+        self.wait()
+        box = {}
+        cancel = threading.Event()
+        gpu = self.gpu
+
+        def work():
+            try:
+                out = []
+                for salt in salts:
+                    if salt is None or cancel.is_set():
+                        out.append(None)
+                        continue
+                    if isinstance(gpu, GpuPBKDF2):
+                        out.append(gpu.derive_keys(cands, salt, should_cancel=cancel.is_set))
+                    else:
+                        out.append(gpu.derive_keys(cands, salt))
+                box['ok'] = out
+            except BaseException as e:
+                box['err'] = e
+        t = threading.Thread(target=work, name='unmicro-gpu-kdf')
+        t.daemon = True
+        self._thread, self._box, self._cancel = (t, box, cancel)
+        t.start()
+
+    def result(self):
+        """The derived keys of the last start(); re-raises its error."""
+        t, box = (self._thread, self._box)
+        self._thread = self._box = self._cancel = None
+        if t is None:
+            return None
+        t.join()
+        if 'err' in box:
+            raise box['err']
+        return box['ok']
+
+    def wait(self, cancel=True):
+        """Settle anything in flight and drop its result."""
+        if self._thread is not None:
+            if cancel:
+                self._cancel.set()
+            self._thread.join()
+        self._thread = self._box = self._cancel = None
+
+class _Background(object):
+    """One call of fn(*args) on a helper thread; result() joins and returns
+    it or re-raises its error. Used to keep the GPU busy while the CPU works."""
+
+    def __init__(self):
+        self._thread = None
+        self._box = None
+
+    def start(self, fn, *args):
+        import threading
+        self.wait()
+        box = {}
+
+        def work():
+            try:
+                box['ok'] = fn(*args)
+            except BaseException as e:
+                box['err'] = e
+        t = threading.Thread(target=work, name='unmicro-gpu')
+        t.daemon = True
+        self._thread, self._box = (t, box)
+        t.start()
+
+    def result(self):
+        t, box = (self._thread, self._box)
+        self._thread = self._box = None
+        if t is None:
+            raise RuntimeError('nothing started')
+        t.join()
+        if 'err' in box:
+            raise box['err']
+        return box['ok']
+
+    def wait(self):
+        if self._thread is not None:
+            self._thread.join()
+        self._thread = self._box = None
+
+def _gcm_probe_salts(probe_paths):
+    out = []
+    for path in probe_paths:
+        try:
+            out.append(gcm_header(path)[1])
+        except (OSError, ValueError):
+            out.append(None)
+    return out
+
+def _gcm_gpu_chunk(gpu, chunk, probe_paths, pool, workers, should_stop=None, derived=None, salts=None):
     """sweep_gcm's chunk with the PBKDF2 on the GPU. Same result as
     _gcm_worker_chunk: a guess that opens a probe is not tried on the next.
     Every derived key is still checked against the full tag on the CPU,
-    across the pool, in waves. Returns (hits, carry): when should_stop()
-    turns true between waves, the checks end there and carry holds every
-    guess of the chunk that has not opened a probe, to be tried again in
-    full, so a pause loses nothing."""
+    across the pool, in waves. derived, when given, holds the GPU's keys
+    for chunk already, one list per probe (from _GpuAhead); otherwise they
+    are derived here. Returns (hits, carry): when should_stop() turns true
+    between waves, the checks end there and carry holds every guess of the
+    chunk that has not opened a probe, to be tried again in full, so a
+    pause loses nothing."""
     hits = []
     left = list(chunk)
     wave = max(1, workers) * GCM_GPU_VERIFY_WAVE
-    for path in probe_paths:
+    if salts is None:
+        salts = _gcm_probe_salts(probe_paths)
+    for pi, path in enumerate(probe_paths):
         if not left:
             break
-        try:
-            salt = gcm_header(path)[1]
-        except (OSError, ValueError):
+        salt = salts[pi]
+        if salt is None:
             continue
-        pairs = list(zip(left, gpu.derive_keys(left, salt)))
+        if derived is not None and derived[pi] is not None:
+            # Keys were derived for the whole chunk; keep those still left.
+            dk_of = dict(zip(chunk, derived[pi]))
+            pairs = [(c, dk_of[c]) for c in left]
+        else:
+            pairs = list(zip(left, gpu.derive_keys(left, salt)))
         opened = set()
         for w in range(0, len(pairs), wave):
             if should_stop is not None and should_stop():
@@ -2722,8 +3086,7 @@ def _gcm_map_worker(job):
         return (path, None, None, None)
     for i, k in enumerate(keys):
         dk = dks[i] if dks is not None else gcm_kdf(k, salt)
-        pt, _ = gcm_stream(path, size, iv, tag, dk, keep=False)
-        if pt is not None:
+        if gcm_key_opens(path, size, iv, tag, dk):
             return (path, k, salt, dk)
     return (path, None, None, None)
 
@@ -2741,6 +3104,28 @@ def _make_pool(workers, initializer=None, initargs=()):
     except Exception:
         return None
 
+GCM_GATE_SECS = 30 * 60
+
+def _fmt_rate(rate):
+    """Time per guess, in words, for a rate in guesses a second."""
+    if rate <= 0:
+        return 'an unknown time'
+    per = 1.0 / rate
+    if per >= 1.0:
+        return '%.1f seconds a guess' % per
+    if per >= 0.001:
+        return '%.0f milliseconds a guess (%s a second)' % (per * 1000, fmt_count(int(rate)))
+    return 'under a millisecond a guess (%s a second)' % fmt_count(int(rate))
+
+def _fmt_long(secs):
+    if secs < 5400:
+        return _fmt_duration(secs)
+    if secs < 172800:
+        return '%.1f hours' % (secs / 3600.0)
+    if secs < 86400 * 365 * 2:
+        return '%.1f days' % (secs / 86400.0)
+    return '%s years' % fmt_count(int(secs / (86400 * 365)))
+
 def _fmt_duration(secs):
     if secs < 90:
         return '%.0f seconds' % secs
@@ -2748,27 +3133,136 @@ def _fmt_duration(secs):
         return '%.0f minutes' % (secs / 60.0)
     return '%.1f hours' % (secs / 3600.0)
 
-def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None, gpu=None):
+# GCM checkpoints. One file holds an entry per probe set (the same run makes
+# several GCM sweeps over different sets of files: the quick methods first,
+# the open-ended ones last), so resuming one never discards another. The
+# file sits next to the ECB checkpoint, as <checkpoint>.gcm.
+GCM_CKPT_SUFFIX = '.gcm'
+GCM_CKPT_KEEP = 16
+# Rate a GCM guess runs at, measured over this run's sweeps and used to say
+# how long an open-ended GCM method would take. (guesses, seconds)
+_GCM_RATE = [0, 0.0]
+
+def gcm_rate(gpu=None, workers=1):
+    """Guesses a second on the GCM files: measured once there is enough to
+    go on, else a conservative figure for this hardware."""
+    n, secs = _GCM_RATE
+    if n >= 32 and secs > 1.0:
+        return n / secs
+    return 1000.0 if gpu is not None else 8.0 * max(1, workers)
+
+def gcm_checkpoint_path(checkpoint):
+    return checkpoint + GCM_CKPT_SUFFIX if checkpoint else None
+
+def _gcm_ckpt_sig(probe_order):
+    h = hashlib.blake2b(digest_size=8)
+    for path in probe_order:
+        try:
+            _size, salt, iv, tag = gcm_header(path)
+        except (OSError, ValueError):
+            continue
+        h.update(salt + iv + tag)
+    return h.hexdigest()
+
+def _gcm_ckpt_read(path):
+    if not path:
+        return {}
+    try:
+        import json
+        with open(long_path(path), 'r', encoding='utf-8') as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _gcm_ckpt_load(path, sig):
+    """(tier, round, consumed, tried) saved for this probe set, or Nones."""
+    e = _gcm_ckpt_read(path).get(sig)
+    try:
+        return (e['tier'], int(e['round']), int(e['consumed']), int(e['tried']))
+    except Exception:
+        return (None, 0, 0, 0)
+
+def _gcm_ckpt_write(path, data):
+    try:
+        import json
+        tmp = path + '.part'
+        with open(long_path(tmp), 'w', encoding='utf-8') as fh:
+            json.dump(data, fh)
+        os.replace(long_path(tmp), long_path(path))
+    except Exception:
+        pass
+
+def _gcm_ckpt_save(path, sig, tier, rnd, consumed, tried):
+    if not path:
+        return
+    d = _gcm_ckpt_read(path)
+    d.pop(sig, None)
+    d[sig] = {'tier': tier, 'round': rnd, 'consumed': consumed, 'tried': tried, 't': time.time()}
+    while len(d) > GCM_CKPT_KEEP:
+        oldest = min(d, key=lambda k: d[k].get('t', 0) if isinstance(d[k], dict) else 0)
+        d.pop(oldest)
+    _gcm_ckpt_write(path, d)
+
+def _gcm_ckpt_clear(path, sig):
+    if not path:
+        return
+    d = _gcm_ckpt_read(path)
+    if sig in d:
+        d.pop(sig)
+        if d:
+            _gcm_ckpt_write(path, d)
+        else:
+            try:
+                os.remove(long_path(path))
+            except OSError:
+                pass
+
+def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None, gpu=None, checkpoint=None, on_tier_start=None):
     """Returns (found keys, guesses tried). probed, when given, is a set
     that collects every file a guess was actually checked against. gpu, a
-    GpuPBKDF2 that has passed its self-test, takes over the PBKDF2."""
+    GpuPBKDF2 that has passed its self-test, takes over the PBKDF2, and
+    derives the next chunk's keys while the CPU checks this one's tags.
+
+    Every method in plan is run, in order; which ones a GCM search gets is
+    the caller's choice. checkpoint (a GCM checkpoint file, see
+    gcm_checkpoint_path) saves progress after each chunk and resumes from
+    it. on_tier_start(name, index), when it returns False, stops the sweep
+    before that method, its place saved, as for the older files."""
     order = gcm_probe_order(files)
     if not order:
         return ([], 0)
     if probed is None:
         probed = set()
-    tiers = [(n, f) for n, f in plan if n in GCM_TIERS]
+    tiers = list(plan)
+    names = [n for n, _ in tiers]
+    sig = _gcm_ckpt_sig(order) if checkpoint else None
+    saved_tier, saved_round, saved_consumed, tried = _gcm_ckpt_load(checkpoint, sig) if checkpoint else (None, 0, 0, 0)
+    start_tier = names.index(saved_tier) if saved_tier in names else 0
+    if saved_tier is not None and saved_tier not in names:
+        saved_round, saved_consumed, tried = (0, 0, 0)
+    if not quiet and (start_tier or saved_consumed or saved_round or tried):
+        STATUS.say('  Resuming from saved progress: %s keys were already tried on these files.' % fmt_count(tried))
+        STATUS.tech("  resuming GCM checkpoint: '%s', round %d, %d candidate(s) in" % (names[start_tier], saved_round + 1, saved_consumed))
     _gcm_worker_init()
     pool = _make_pool(workers, _gcm_worker_init)
     first_seen = BoundedSeen()
-    tried = 0
     t0 = time.time()
+    tried_at_start = tried
     chunk_size = cpu_chunk = max(1, workers) * 4
     if gpu is not None:
         chunk_size = max(chunk_size, gpu.batch)
+    ahead = _GpuAhead(gpu) if gpu is not None else None
     carry = []
     try:
-        for name, factory in tiers:
+        for tier_idx, (name, factory) in enumerate(tiers):
+            if tier_idx < start_tier:
+                continue
+            resume_here = tier_idx == start_tier
+            if on_tier_start is not None and not on_tier_start(name, tier_idx):
+                _gcm_ckpt_save(checkpoint, sig, name, saved_round if resume_here else 0, saved_consumed if resume_here else 0, tried)
+                STATUS.gate_declined = True
+                return ([], tried)
             tier_start = tried
             found = []
             if name in GCM_ROTATE_TIERS:
@@ -2780,61 +3274,128 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None, gpu=
                 cands = None
                 rounds = 1
             probes = []
-            STATUS.method(tiers.index((name, factory)) + 1, len(tiers))
+            STATUS.method(tier_idx + 1, len(tiers))
+            r = 0
             for r in range(rounds):
+                if resume_here and r < saved_round:
+                    continue
                 probes = order[r * GCM_PROBES:(r + 1) * GCM_PROBES]
                 if not probes:
                     break
+                salts = _gcm_probe_salts(probes)
                 gen = iter(cands) if cands is not None else factory()
                 seen = first_seen if r == 0 else BoundedSeen()
+                pos = 0
+                if resume_here and r == saved_round and saved_consumed:
+                    if not quiet:
+                        STATUS.live('Picking up where the last run stopped...')
+                    collections.deque(itertools.islice(gen, saved_consumed), maxlen=0)
+                    pos = saved_consumed
                 if name == 'recovered key variants' and not quiet:
                     gen = list(gen)
-                    rate = tried / max(time.time() - t0, 0.001)
-                    if tried and rate > 0:
+                    rate = (tried - tried_at_start) / max(time.time() - t0, 0.001)
+                    if tried > tried_at_start and rate > 0:
                         STATUS.say('  Trying %s: %s keys, roughly %s at this machine\'s speed.' % (plain_method(name), fmt_count(len(gen)), _fmt_duration(len(gen) / rate)))
                         STATUS.say('  Press Ctrl+C at any time to pause.')
                     gen = iter(gen)
-                while True:
+                state = {'pos': pos, 'queued': 0}
+                # Where in the generator each guess not yet checked came
+                # from, so the checkpoint never skips one that was not tried.
+                pos_of = {}
+
+                def next_chunk():
                     # Guesses a pause cut short come first, already in seen.
+                    nonlocal carry
                     chunk, carry = (carry[:chunk_size], carry[chunk_size:])
-                    for cand in gen if len(chunk) < chunk_size else ():
-                        if not cand or cand in seen:
-                            continue
-                        seen.add(cand)
-                        chunk.append(cand)
-                        if len(chunk) >= chunk_size:
-                            break
+                    if len(chunk) < chunk_size:
+                        for cand in gen:
+                            state['pos'] += 1
+                            if not cand or cand in seen:
+                                continue
+                            seen.add(cand)
+                            pos_of[cand] = state['pos']
+                            chunk.append(cand)
+                            if len(chunk) >= chunk_size:
+                                break
                     if limit:
-                        chunk = chunk[:max(0, limit - tried)]
-                    if not chunk:
-                        break
+                        room = max(0, limit - tried - state['queued'])
+                        if len(chunk) > room:
+                            carry = chunk[room:] + carry
+                            chunk = chunk[:room]
+                    return (chunk, pos_of.get(chunk[-1], state['pos']) if chunk else state['pos'])
+                chunk, chunk_pos = next_chunk()
+                if ahead is not None and chunk:
+                    ahead.start(chunk, salts)
+                    state['queued'] = len(chunk)
+                while chunk:
                     probed.update(probes)
                     hits = None
                     cut = []
-                    if gpu is not None:
+                    nxt, nxt_pos = ([], chunk_pos)
+                    if ahead is not None and gpu is not None:
                         try:
-                            hits, cut = _gcm_gpu_chunk(gpu, chunk, probes, pool, workers, should_stop=lambda: STATUS.pause_requested)
+                            derived = ahead.result()
+                            # The next chunk's keys are derived while this
+                            # one's tags are checked.
+                            nxt, nxt_pos = next_chunk()
+                            if nxt:
+                                ahead.start(nxt, salts)
+                            state['queued'] = len(nxt)
+                            hits, cut = _gcm_gpu_chunk(gpu, chunk, probes, pool, workers, should_stop=lambda: STATUS.pause_requested, derived=derived, salts=salts)
                         except Exception as e:
+                            ahead.wait()
                             _gpu_gcm_failed(e, quiet)
                             gpu = None
+                            ahead = None
                             chunk_size = cpu_chunk
+                            hits = None
+                            cut = []
+                            # The prefetched guesses go back in line.
+                            carry = nxt + carry
+                            nxt, nxt_pos = ([], chunk_pos)
+                            state['queued'] = 0
                     if hits is None and pool:
                         hits = []
                         for part in pool.map(_gcm_worker_chunk, [(chunk[i::workers], probes) for i in range(workers)]):
                             hits.extend(part)
                     elif hits is None:
                         hits = _gcm_worker_chunk((chunk, probes))
-                    tried += len(chunk) - len(cut)
+                    done_now = len(chunk) - len(cut)
+                    tried += done_now
+                    _GCM_RATE[0] += done_now
                     carry = cut + carry
                     for cand, _path, salt, dk in hits:
                         _kdf_remember(cand, salt, dk)
                         if cand not in found:
                             found.append(cand)
+                    cutset = set(cut)
+                    for c in chunk:
+                        if c not in cutset:
+                            pos_of.pop(c, None)
+                    # Saved only when nothing at or before this place is
+                    # still waiting (a pause's cut guesses, say).
+                    if all(pos_of.get(c, 0) > chunk_pos for c in carry):
+                        _gcm_ckpt_save(checkpoint, sig, name, r, chunk_pos, tried)
                     if not quiet:
-                        STATUS.progress(name, tried, tried / max(time.time() - t0, 0.001), gcm=True)
-                    STATUS.check_pause()
+                        STATUS.progress(name, tried, (tried - tried_at_start) / max(time.time() - t0, 0.001), gcm=True)
                     if found or (limit and tried >= limit):
                         break
+                    STATUS.check_pause()
+                    if ahead is not None and gpu is not None:
+                        if nxt:
+                            # Already being derived. Guesses a pause cut
+                            # short wait in carry and follow it.
+                            chunk, chunk_pos = (nxt, nxt_pos)
+                        else:
+                            chunk, chunk_pos = next_chunk()
+                            if chunk:
+                                ahead.start(chunk, salts)
+                                state['queued'] = len(chunk)
+                    else:
+                        chunk, chunk_pos = next_chunk()
+                if ahead is not None:
+                    ahead.wait()
+                    state['queued'] = 0
                 if found or (limit and tried >= limit):
                     break
             if not quiet:
@@ -2844,13 +3405,20 @@ def sweep_gcm(files, plan, workers=1, limit=None, quiet=False, probed=None, gpu=
                     spread = '  (tested on %d file(s))' % upto
                 STATUS.tier_done(name, tried - tier_start, bool(found), spread, gcm=True)
             if found:
+                _gcm_ckpt_clear(checkpoint, sig)
                 return (found, tried)
             if limit and tried >= limit:
                 return ([], tried)
+            nxt_name = names[tier_idx + 1] if tier_idx + 1 < len(names) else name
+            _gcm_ckpt_save(checkpoint, sig, nxt_name, 0, 0, tried)
     finally:
+        if ahead is not None:
+            ahead.wait()
+        _GCM_RATE[1] += time.time() - t0
         if pool:
             pool.terminate()
             pool.join()
+    _gcm_ckpt_clear(checkpoint, sig)
     return ([], tried)
 
 def _gcm_gpu_map_jobs(gpu, jobs):
@@ -2889,14 +3457,22 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False, gpu=None):
     if gpu is not None:
         per = max(1, gpu.batch // max(1, len(keys)))
         slices = [jobs[i:i + per] for i in range(0, len(jobs), per)]
+    # The GPU derives the next slice's keys on a helper thread while the
+    # pool checks this slice's tags.
+    bg = _Background() if gpu is not None else None
     try:
-        for part in slices:
-            if gpu is not None:
+        if bg is not None:
+            bg.start(_gcm_gpu_map_jobs, gpu, slices[0])
+        for si, part in enumerate(slices):
+            if bg is not None and gpu is not None:
                 if not quiet:
                     STATUS.live('Checking files against the key found: %s of %s done, %s elapsed (deriving keys on the GPU)' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
                 try:
-                    part = _gcm_gpu_map_jobs(gpu, part)
+                    part = bg.result()
+                    if si + 1 < len(slices):
+                        bg.start(_gcm_gpu_map_jobs, gpu, slices[si + 1])
                 except Exception as e:
+                    bg.wait()
                     _gpu_gcm_failed(e, quiet)
                     gpu = None
             results = pool.imap_unordered(_gcm_map_worker, part) if pool else map(_gcm_map_worker, part)
@@ -2908,6 +3484,8 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False, gpu=None):
                 if not quiet and (done % 8 == 0 or done == len(jobs)):
                     STATUS.live('Checking files against the key found: %s of %s done, %s elapsed' % (fmt_count(done), fmt_count(len(jobs)), fmt_elapsed(time.time() - t0)))
     finally:
+        if bg is not None:
+            bg.wait()
         if pool:
             pool.terminate()
             pool.join()
@@ -2918,12 +3496,13 @@ def map_gcm_keys_to_files(files, keys, workers=1, quiet=False, gpu=None):
         mapping[k].sort(key=lambda p: order.get(p, 0))
     return mapping
 
-def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, on_part=None, probed=None, later_plan=None, gpu=None):
+def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8, on_part=None, probed=None, later_plan=None, gpu=None, checkpoint=None, on_tier_start=None):
     """on_part(mapping_part) is called as soon as each found key has been
     mapped, so a caller interrupted later still has every file matched so
     far. later_plan, when given, replaces plan once a key has opened
     files, so the files already opened are not held back behind a long
-    search for the stragglers."""
+    search for the stragglers. checkpoint and on_tier_start go to each
+    sweep (see sweep_gcm)."""
     mapping = {}
     remaining = [f for f in files if gcm_shaped(file_size(f))]
     tried_total = 0
@@ -2941,14 +3520,23 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
         if mapping and (not quiet):
             if STATUS.verbose:
                 print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
-                skipped = [n for n, _ in plan if n in GCM_TIERS and n not in [m for m, _ in pass_plan]]
+                skipped = [n for n, _ in plan if n not in [m for m, _ in pass_plan]]
                 if skipped:
                     print('  (skipping %s for these, since a key is already found;' % ', '.join(skipped))
                     print('   re-run with --brute to include them)')
             else:
                 print('  %d file(s) are not opened by the key found so far. Looking for another key' % len(remaining))
                 print('  for them (some may have been locked with a different key):')
-        found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed, gpu=gpu)
+        if not pass_plan:
+            break
+        declined_before = STATUS.gate_declined
+        STATUS.gate_declined = False
+        found, tried = sweep_gcm(remaining, pass_plan, workers=workers, limit=budget, quiet=quiet, probed=probed, gpu=gpu, checkpoint=checkpoint, on_tier_start=on_tier_start)
+        declined = STATUS.gate_declined
+        STATUS.gate_declined = declined or declined_before
+        if declined:
+            tried_total += tried
+            break
         tried_total += tried
         fresh = [k for k in found if k not in mapping]
         if not fresh:
@@ -2971,32 +3559,194 @@ def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passe
 def _gpu_kernel_source():
     sbox = ','.join((str(b) for b in _SBOX))
     isbox = ','.join((str(b) for b in _INV_SBOX))
-    return _GPU_KERNEL_TEMPLATE.replace('KERNEL_INVSBOX_DATA', isbox).replace('KERNEL_SBOX_DATA', sbox) + _GPU_MAGIC_KERNEL
-# Batch decrypt with the signature match on the device: one byte per
-# supplied key, 1 where its plaintext block starts like a known file type.
-# filter_chunk uses it, so only those flags cross the bus.
-_GPU_MAGIC_KERNEL = r'''
-__kernel void aes256_ecb_magic(__global const uchar* keys, __global const uchar* ct,
-                               __global const uchar* mbytes, __global const uint* moff,
-                               __global const uchar* mat, __global const uchar* mlen, const uint M,
-                               __global uchar* flags, const uint n){
+    return _GPU_KERNEL_TEMPLATE.replace('KERNEL_INVSBOX_DATA', isbox).replace('KERNEL_SBOX_DATA', sbox)
+# The older format's GPU kernels. AES works on 32-bit packed columns with the
+# S-boxes in local memory and InvMixColumns as a handful of shifts and XORs
+# (it used to be sixteen bit-by-bit field multiplications a round), and the
+# signature match runs on the device. Every launch is checked against the
+# CPU by GpuAES.selftest and mask_selftest before the GPU is used.
+_GPU_KERNEL_TEMPLATE = r'''
+__constant uchar SBOX[256]  = {KERNEL_SBOX_DATA};
+__constant uchar ISBOX[256] = {KERNEL_INVSBOX_DATA};
+__constant uint RCON[8]     = {0,1,2,4,8,16,32,64};
+
+/* The S-boxes are read with a different index by every work-item, which
+   constant memory serves one address at a time, so each work-group first
+   copies them into local memory. Every kernel calls this before its
+   bounds check, since all of a group must reach the barrier. */
+#define LOAD_SBOXES(ls, lis) \
+    __local uchar ls[256], lis[256]; \
+    for(uint i_ = get_local_id(0); i_ < 256; i_ += get_local_size(0)){ ls[i_] = SBOX[i_]; lis[i_] = ISBOX[i_]; } \
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+/* Columns are packed into uints, row 0 in the low byte, so the block's
+   bytes 4c..4c+3 are column c, as in the byte-wise reference. */
+#define ROTR8(x)  rotate((uint)(x), 24u)
+#define ROTR16(x) rotate((uint)(x), 16u)
+#define ROTR24(x) rotate((uint)(x), 8u)
+
+inline uint mul2(uint x){
+    return ((x & 0x7f7f7f7fu) << 1) ^ (((x >> 7) & 0x01010101u) * 0x1bu);
+}
+
+inline uint sub_word(__local const uchar* sb, uint w){
+    return (uint)sb[w & 255] | ((uint)sb[(w >> 8) & 255] << 8) | ((uint)sb[(w >> 16) & 255] << 16) | ((uint)sb[w >> 24] << 24);
+}
+
+/* InvMixColumns of one column: first a0^=4(a0^a2), a1^=4(a1^a3) and the
+   same for a2, a3, which turns it into MixColumns, then MixColumns as
+   b_r = 2(a_r^a_r+1) ^ a_r+1 ^ a_r+2 ^ a_r+3, all four rows at once. */
+inline uint inv_mix(uint w){
+    w ^= mul2(mul2(w ^ ROTR16(w)));
+    uint r1 = ROTR8(w);
+    return mul2(w ^ r1) ^ r1 ^ ROTR16(w) ^ ROTR24(w);
+}
+
+/* AES-256 key schedule into 60 packed words. */
+inline void aes256_expand(__local const uchar* sb, const uchar* key, uint* rk){
+    #pragma unroll
+    for(int i=0;i<8;i++) rk[i] = (uint)key[4*i] | ((uint)key[4*i+1] << 8) | ((uint)key[4*i+2] << 16) | ((uint)key[4*i+3] << 24);
+    #pragma unroll
+    for(int i=8;i<60;i++){
+        uint t = rk[i-1];
+        if(i % 8 == 0) t = sub_word(sb, ROTR8(t)) ^ RCON[i / 8];
+        else if(i % 8 == 4) t = sub_word(sb, t);
+        rk[i] = rk[i-8] ^ t;
+    }
+}
+
+/* InvShiftRows then InvSubBytes for one output column: row r of column c
+   comes from column c - r. */
+#define INV_SR_SB(isb, a, b, c, d) ((uint)isb[(a) & 255] | ((uint)isb[((b) >> 8) & 255] << 8) | ((uint)isb[((c) >> 16) & 255] << 16) | ((uint)isb[(d) >> 24] << 24))
+
+/* AES-256 single block decrypt under an expanded key, ct and out as 16
+   bytes. The one place the cipher lives; every kernel below calls it. */
+inline void aes256_decrypt_rk(__local const uchar* isb, const uint* rk, const uchar* ct, uchar* out){
+    uint s0, s1, s2, s3;
+    s0 = ((uint)ct[0]  | ((uint)ct[1]  << 8) | ((uint)ct[2]  << 16) | ((uint)ct[3]  << 24)) ^ rk[56];
+    s1 = ((uint)ct[4]  | ((uint)ct[5]  << 8) | ((uint)ct[6]  << 16) | ((uint)ct[7]  << 24)) ^ rk[57];
+    s2 = ((uint)ct[8]  | ((uint)ct[9]  << 8) | ((uint)ct[10] << 16) | ((uint)ct[11] << 24)) ^ rk[58];
+    s3 = ((uint)ct[12] | ((uint)ct[13] << 8) | ((uint)ct[14] << 16) | ((uint)ct[15] << 24)) ^ rk[59];
+    #pragma unroll
+    for(int round = 13; round >= 1; round--){
+        uint t0 = INV_SR_SB(isb, s0, s3, s2, s1) ^ rk[4*round + 0];
+        uint t1 = INV_SR_SB(isb, s1, s0, s3, s2) ^ rk[4*round + 1];
+        uint t2 = INV_SR_SB(isb, s2, s1, s0, s3) ^ rk[4*round + 2];
+        uint t3 = INV_SR_SB(isb, s3, s2, s1, s0) ^ rk[4*round + 3];
+        s0 = inv_mix(t0); s1 = inv_mix(t1); s2 = inv_mix(t2); s3 = inv_mix(t3);
+    }
+    uint o0 = INV_SR_SB(isb, s0, s3, s2, s1) ^ rk[0];
+    uint o1 = INV_SR_SB(isb, s1, s0, s3, s2) ^ rk[1];
+    uint o2 = INV_SR_SB(isb, s2, s1, s0, s3) ^ rk[2];
+    uint o3 = INV_SR_SB(isb, s3, s2, s1, s0) ^ rk[3];
+    #pragma unroll
+    for(int i=0;i<4;i++){
+        out[i] = (uchar)(o0 >> (8*i)); out[4+i] = (uchar)(o1 >> (8*i));
+        out[8+i] = (uchar)(o2 >> (8*i)); out[12+i] = (uchar)(o3 >> (8*i));
+    }
+}
+
+inline void aes256_decrypt(__local const uchar* sb, __local const uchar* isb, const uchar* key, const uchar* ct, uchar* out){
+    uint rk[60];
+    aes256_expand(sb, key, rk);
+    aes256_decrypt_rk(isb, rk, ct, out);
+}
+
+/* Batch decrypt: one supplied 32-byte key per work-item. Used by the AES
+   self-test. */
+__kernel void aes256_ecb_decrypt(__global const uchar* keys,
+                                 __global const uchar* ct,
+                                 __global uchar* out,
+                                 const uint n){
+    LOAD_SBOXES(ls, lis)
     uint gid = get_global_id(0);
     if(gid >= n) return;
-    uchar key[32], c[16], pt[16];
+    uchar key[32], c[16], o[16];
     for(int i=0;i<32;i++) key[i] = keys[(ulong)gid*32 + i];
     for(int i=0;i<16;i++) c[i] = ct[i];
-    aes256_decrypt(key, c, pt);
-    uchar hit = 0;
-    for(uint m=0;m<M && !hit;m++){
+    aes256_decrypt(ls, lis, key, c, o);
+    for(int i=0;i<16;i++) out[(ulong)gid*16 + i] = o[i];
+}
+
+/* On-device structural brute. Each work-item turns its own index into a
+   candidate over the alphabet, builds the key, decrypts, and checks the magic
+   table, writing only the indices that hit. No candidate ever crosses the bus,
+   which is what lets this run at GPU speed instead of at Python speed.
+
+   idx = start + gid, decomposed mixed-radix over the alphabet (position 0 of
+   the string is most significant). Each character contributes its UTF-8 bytes,
+   packed into the 32-byte key exactly as key_bytes() does on the host. */
+__kernel void aes256_brute_mask(
+        __global const uchar* alpha,  __global const uint*  aoff,
+        __global const uchar* alen,   const uint N, const uint L,
+        const ulong start, const uint count,
+        __global const uchar* ct,
+        __global const uchar* mbytes, __global const uint* moff,
+        __global const uchar* mat,    __global const uchar* mlen, const uint M,
+        __global uint* out_idx, volatile __global uint* out_cnt, const uint out_cap){
+    LOAD_SBOXES(ls, lis)
+    uint gid = get_global_id(0);
+    if(gid >= count) return;
+    ulong idx = start + (ulong)gid;
+
+    uchar d[32];
+    ulong rem = idx;
+    for(uint p=0;p<L;p++){ d[p] = (uchar)(rem % (ulong)N); rem /= (ulong)N; }
+
+    uchar key[32];
+    for(int i=0;i<32;i++) key[i] = 0;
+    uint kb = 0;
+    for(uint s=0;s<L;s++){
+        uint ci = d[L-1-s];
+        uint off = aoff[ci];
+        uint ln  = alen[ci];
+        for(uint b=0;b<ln;b++){ if(kb<32){ key[kb] = alpha[off+b]; kb++; } }
+    }
+
+    uchar c[16]; for(int i=0;i<16;i++) c[i] = ct[i];
+    uchar pt[16]; aes256_decrypt(ls, lis, key, c, pt);
+
+    for(uint m=0;m<M;m++){
         uint at=mat[m], ln=mlen[m], mo=moff[m];
         bool ok = true;
         for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }
-        if(ok) hit = 1;
+        if(ok){
+            uint slot = atomic_inc(out_cnt);
+            if(slot < out_cap) out_idx[slot] = gid;
+            return;
+        }
     }
-    flags[gid] = hit;
+}
+
+/* Batch decrypt with the signature match on the device: one byte per
+   supplied key and probe, 1 where its plaintext block starts like a known
+   file type. The keys go up once and every probe block is tried in the
+   same launch, so only those flags cross the bus. */
+__kernel void aes256_ecb_magic(__global const uchar* keys, __global const uchar* cts, const uint P,
+                               __global const uchar* mbytes, __global const uint* moff,
+                               __global const uchar* mat, __global const uchar* mlen, const uint M,
+                               __global uchar* flags, const uint n){
+    LOAD_SBOXES(ls, lis)
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    uchar key[32], c[16], pt[16];
+    uint rk[60];
+    for(int i=0;i<32;i++) key[i] = keys[(ulong)gid*32 + i];
+    aes256_expand(ls, key, rk);
+    for(uint p=0;p<P;p++){
+        for(int i=0;i<16;i++) c[i] = cts[16*p + i];
+        aes256_decrypt_rk(lis, rk, c, pt);
+        uchar hit = 0;
+        for(uint m=0;m<M && !hit;m++){
+            uint at=mat[m], ln=mlen[m], mo=moff[m];
+            bool ok = true;
+            for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }
+            if(ok) hit = 1;
+        }
+        flags[(ulong)p*n + gid] = hit;
+    }
 }
 '''
-_GPU_KERNEL_TEMPLATE = '\n__constant uchar SBOX[256]  = {KERNEL_SBOX_DATA};\n__constant uchar ISBOX[256] = {KERNEL_INVSBOX_DATA};\n__constant uchar RCON[8]    = {0,1,2,4,8,16,32,64};\n\ninline uchar gmul(uchar a, uchar b){\n    uchar p = 0;\n    for(int i=0;i<8;i++){\n        if(b & 1) p ^= a;\n        uchar hi = a & 0x80;\n        a <<= 1;\n        if(hi) a ^= 0x1b;\n        b >>= 1;\n    }\n    return p;\n}\n\n/* AES-256-ECB single block decrypt. All args private. This is the one place\n   the cipher lives; both kernels below call it. */\nvoid aes256_decrypt(const uchar* key, const uchar* ct, uchar* out){\n    uchar rk[240];\n    for(int i=0;i<32;i++) rk[i] = key[i];\n    int rconi = 1;\n    for(int i=8;i<60;i++){\n        uchar t0=rk[(i-1)*4+0], t1=rk[(i-1)*4+1], t2=rk[(i-1)*4+2], t3=rk[(i-1)*4+3];\n        if(i%8==0){\n            uchar tmp=t0;\n            t0 = SBOX[t1] ^ RCON[rconi]; t1 = SBOX[t2]; t2 = SBOX[t3]; t3 = SBOX[tmp];\n            rconi++;\n        } else if(i%8==4){\n            t0=SBOX[t0]; t1=SBOX[t1]; t2=SBOX[t2]; t3=SBOX[t3];\n        }\n        rk[i*4+0]=rk[(i-8)*4+0]^t0; rk[i*4+1]=rk[(i-8)*4+1]^t1;\n        rk[i*4+2]=rk[(i-8)*4+2]^t2; rk[i*4+3]=rk[(i-8)*4+3]^t3;\n    }\n    uchar s[16], t[16];\n    for(int i=0;i<16;i++) s[i] = ct[i] ^ rk[14*16 + i];\n    for(int round=13; round>=1; round--){\n        for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];\n        for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];\n        for(int i=0;i<16;i++) t[i] ^= rk[round*16 + i];\n        for(int c=0;c<4;c++){\n            uchar a0=t[4*c+0],a1=t[4*c+1],a2=t[4*c+2],a3=t[4*c+3];\n            s[4*c+0]=gmul(a0,14)^gmul(a1,11)^gmul(a2,13)^gmul(a3,9);\n            s[4*c+1]=gmul(a0,9)^gmul(a1,14)^gmul(a2,11)^gmul(a3,13);\n            s[4*c+2]=gmul(a0,13)^gmul(a1,9)^gmul(a2,14)^gmul(a3,11);\n            s[4*c+3]=gmul(a0,11)^gmul(a1,13)^gmul(a2,9)^gmul(a3,14);\n        }\n    }\n    for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];\n    for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];\n    for(int i=0;i<16;i++) out[i] = t[i] ^ rk[0*16 + i];\n}\n\n/* Batch decrypt: one supplied 32-byte key per work-item. Used by filter_chunk\n   and by the AES self-test. */\n__kernel void aes256_ecb_decrypt(__global const uchar* keys,\n                                 __global const uchar* ct,\n                                 __global uchar* out,\n                                 const uint n){\n    uint gid = get_global_id(0);\n    if(gid >= n) return;\n    uchar key[32], c[16], o[16];\n    for(int i=0;i<32;i++) key[i] = keys[(uint)gid*32 + i];\n    for(int i=0;i<16;i++) c[i] = ct[i];\n    aes256_decrypt(key, c, o);\n    for(int i=0;i<16;i++) out[(uint)gid*16 + i] = o[i];\n}\n\n/* On-device structural brute. Each work-item turns its own index into a\n   candidate over the alphabet, builds the key, decrypts, and checks the magic\n   table, writing only the indices that hit. No candidate ever crosses the bus,\n   which is what lets this run at GPU speed instead of at Python speed.\n\n   idx = start + gid, decomposed mixed-radix over the alphabet (position 0 of\n   the string is most significant). Each character contributes its UTF-8 bytes,\n   packed into the 32-byte key exactly as key_bytes() does on the host. */\n__kernel void aes256_brute_mask(\n        __global const uchar* alpha,  __global const uint*  aoff,\n        __global const uchar* alen,   const uint N, const uint L,\n        const ulong start, const uint count,\n        __global const uchar* ct,\n        __global const uchar* mbytes, __global const uint* moff,\n        __global const uchar* mat,    __global const uchar* mlen, const uint M,\n        __global uint* out_idx, volatile __global uint* out_cnt, const uint out_cap){\n    uint gid = get_global_id(0);\n    if(gid >= count) return;\n    ulong idx = start + (ulong)gid;\n\n    uchar d[32];\n    ulong rem = idx;\n    for(uint p=0;p<L;p++){ d[p] = (uchar)(rem % (ulong)N); rem /= (ulong)N; }\n\n    uchar key[32];\n    for(int i=0;i<32;i++) key[i] = 0;\n    uint kb = 0;\n    for(uint s=0;s<L;s++){\n        uint ci = d[L-1-s];\n        uint off = aoff[ci];\n        uint ln  = alen[ci];\n        for(uint b=0;b<ln;b++){ if(kb<32){ key[kb] = alpha[off+b]; kb++; } }\n    }\n\n    uchar c[16]; for(int i=0;i<16;i++) c[i] = ct[i];\n    uchar pt[16]; aes256_decrypt(key, c, pt);\n\n    for(uint m=0;m<M;m++){\n        uint at=mat[m], ln=mlen[m], mo=moff[m];\n        bool ok = true;\n        for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }\n        if(ok){\n            uint slot = atomic_inc(out_cnt);\n            if(slot < out_cap) out_idx[slot] = gid;\n            return;\n        }\n    }\n}\n'
 _GPU_MIN_MAGIC = 3
 
 def _decode_index(idx, alphabet, length):
@@ -3028,6 +3778,11 @@ _CL_MEM_READ_WRITE = 1 << 0
 _CL_MEM_READ_ONLY = 1 << 2
 _CL_MEM_COPY_HOST_PTR = 1 << 5
 _CL_PROGRAM_BUILD_LOG = 0x1183
+_CL_KERNEL_WORK_GROUP_SIZE = 0x11B0
+# Work-group size for the kernels that share S-boxes through local memory:
+# the global size is rounded up to a multiple of it so the runtime never
+# picks a tiny group (one that copies the tables for a single work-item).
+GPU_GROUP = 64
 _CL_DEVICE_NOT_FOUND = -1
 
 def _cl_library_names():
@@ -3083,6 +3838,7 @@ class OpenCL(object):
             'clEnqueueNDRangeKernel': (I, [P, P, U, P, P, P, U, P, P]),
             'clEnqueueReadBuffer': (I, [P, P, U, S, S, P, U, P, P]),
             'clFinish': (I, [P]),
+            'clGetKernelWorkGroupInfo': (I, [P, P, U, S, P, P]),
             'clReleaseMemObject': (I, [P]),
             'clReleaseKernel': (I, [P]),
             'clReleaseProgram': (I, [P]),
@@ -3216,9 +3972,25 @@ class CLSession(object):
                 self.lib.clReleaseMemObject(b.handle)
                 b.handle = None
 
-    def run(self, name, n, *args):
+    def _group_size(self, k, want):
+        ct = self.ct
+        val = ct.c_size_t()
+        try:
+            if self.lib.clGetKernelWorkGroupInfo(k, self.device.handle, _CL_KERNEL_WORK_GROUP_SIZE, ct.sizeof(val), ct.byref(val), None) == 0 and val.value:
+                size = 1
+                while size * 2 <= min(want, val.value):
+                    size *= 2
+                return size
+        except Exception:
+            pass
+        return None
+
+    def run(self, name, n, *args, **kw):
         """Launch kernel name over n work items and wait for it. args are
-        _CLBuffer objects or ctypes scalars (c_uint32, c_uint64)."""
+        _CLBuffer objects or ctypes scalars (c_uint32, c_uint64). group=G
+        launches in work-groups of G (or the largest power of two the kernel
+        allows below it), over n rounded up to a whole number of groups; the
+        kernel must ignore the work-items past n itself."""
         ct = self.ct
         if n <= 0:
             return
@@ -3234,8 +4006,16 @@ class CLSession(object):
                 self.cl.check(self.lib.clSetKernelArg(k, i, ct.sizeof(h), ct.byref(h)), 'clSetKernelArg')
             else:
                 self.cl.check(self.lib.clSetKernelArg(k, i, ct.sizeof(a), ct.byref(a)), 'clSetKernelArg')
-        gsize = (ct.c_size_t * 1)(int(n))
-        self.cl.check(self.lib.clEnqueueNDRangeKernel(self.queue, k, 1, None, gsize, None, 0, None, None), 'clEnqueueNDRangeKernel %s' % name)
+        group = kw.get('group')
+        lsize = None
+        total = int(n)
+        if group:
+            g = self._group_size(k, int(group))
+            if g:
+                total = (total + g - 1) // g * g
+                lsize = (ct.c_size_t * 1)(g)
+        gsize = (ct.c_size_t * 1)(total)
+        self.cl.check(self.lib.clEnqueueNDRangeKernel(self.queue, k, 1, None, gsize, lsize, 0, None, None), 'clEnqueueNDRangeKernel %s' % name)
         self.cl.check(self.lib.clFinish(self.queue), 'clFinish')
 
     def read(self, buf, size):
@@ -3335,24 +4115,28 @@ class GpuAES(object):
         s = self.s
         kb, cb, ob = (s.buffer(keys), s.buffer(ct16), s.buffer(size=n * 16))
         try:
-            s.run('aes256_ecb_decrypt', n, kb, cb, ob, _cl_u32(n))
+            s.run('aes256_ecb_decrypt', n, kb, cb, ob, _cl_u32(n), group=GPU_GROUP)
             return s.read(ob, n * 16)
         finally:
             s.release(kb, cb, ob)
 
-    def magic_flags(self, keys, ct16, table):
-        """One byte per key: 1 where its decrypt of ct16 starts with a
-        signature in table, matched on the device."""
+    def magic_flags(self, keys, cts, table):
+        """For each probe block in cts (16 bytes each, back to back), one
+        byte per key: 1 where its decrypt of that block starts with a
+        signature in table, matched on the device. Returns the flags probe
+        by probe, n per probe; the keys go up once for all of them."""
         n = len(keys) // 32
+        P = len(cts) // 16
         s = self.s
         mb, mo, mat, mlen, M = table
-        bufs = [s.buffer(keys), s.buffer(ct16), s.buffer(mb), s.buffer(mo), s.buffer(mat), s.buffer(mlen)]
-        fb = s.buffer(size=n)
+        bufs = [s.buffer(keys), s.buffer(cts)]
+        rest = [s.buffer(mb), s.buffer(mo), s.buffer(mat), s.buffer(mlen)]
+        fb = s.buffer(size=n * P)
         try:
-            s.run('aes256_ecb_magic', n, *bufs + [_cl_u32(M), fb, _cl_u32(n)])
-            return s.read(fb, n)
+            s.run('aes256_ecb_magic', n, *bufs + [_cl_u32(P)] + rest + [_cl_u32(M), fb, _cl_u32(n)], group=GPU_GROUP)
+            return s.read(fb, n * P)
         finally:
-            s.release(fb, *bufs)
+            s.release(fb, *bufs + rest)
 
     def selftest(self, trials=1024):
         keys = os.urandom(trials * 32)
@@ -3369,16 +4153,29 @@ class GpuAES(object):
             want = bytes((1 if _cpu_magic_hit(b, magics) else 0 for b in cpu))
             if bytes(flags) != want:
                 return False
-        return True
+        # Several probe blocks in one launch, laid out probe by probe.
+        others = [os.urandom(16), os.urandom(16)]
+        flags = self.magic_flags(keys, b''.join([others[0], block, others[1]]), _magic_table(planted))
+        want = bytearray()
+        for blk in (others[0], block, others[1]):
+            dec = cpu if blk is block else [_dec_blocks(keys[i * 32:(i + 1) * 32], blk) for i in range(trials)]
+            want.extend(1 if _cpu_magic_hit(b, planted) else 0 for b in dec)
+        return bytes(flags) == bytes(want)
 
     def filter_chunk(self, candidates, probes):
-        keys = b''.join((key_bytes(c) for c in candidates))
-        flagged = bytearray(len(candidates))
-        for blk, _ in probes:
-            for i, f in enumerate(self.magic_flags(keys, blk, self._all_table)):
-                if f:
-                    flagged[i] = 1
-        return [c for c, f in zip(candidates, flagged) if f]
+        if not candidates or not probes:
+            return []
+        keys = b''.join([key_bytes(c) for c in candidates])
+        n = len(candidates)
+        flags = self.magic_flags(keys, b''.join(blk for blk, _ in probes), self._all_table)
+        hit = bytearray(flags[:n])
+        for p in range(1, len(probes)):
+            part = flags[p * n:(p + 1) * n]
+            if part.count(0) != n:
+                hit = bytearray(a | b for a, b in zip(hit, part))
+        if hit.count(0) == n:
+            return []
+        return [c for c, f in zip(candidates, hit) if f]
 
     def brute_length(self, length, probes, start, count, out_cap=1 << 16):
         s = self.s
@@ -3392,7 +4189,7 @@ class GpuAES(object):
                 oi = s.buffer(size=out_cap * 4)
                 oc = s.buffer_rw(_u32([0]))
                 try:
-                    s.run('aes256_brute_mask', int(count), *fixed + [_cl_u32(self._N), _cl_u32(length), _cl_u64(start), _cl_u32(count), c_b] + table + [_cl_u32(M), oi, oc, _cl_u32(out_cap)])
+                    s.run('aes256_brute_mask', int(count), *fixed + [_cl_u32(self._N), _cl_u32(length), _cl_u64(start), _cl_u32(count), c_b] + table + [_cl_u32(M), oi, oc, _cl_u32(out_cap)], group=GPU_GROUP)
                     n = struct.unpack('<I', s.read(oc, 4))[0]
                     if n:
                         k = min(n, out_cap)
@@ -3563,35 +4360,81 @@ __kernel void pbkdf2_sha256_init(__global const uchar* pw, __global const uint* 
     for(int i=0;i<8;i++){ s[i] = ist[i]; s[8+i] = ost[i]; s[16+i] = u[i]; s[24+i] = u[i]; }
 }
 
-/* Runs `rounds` further PBKDF2 rounds. Each one is HMAC over the 32-byte
-   previous U, which with the pads already hashed is one block for the inner
-   hash and one for the outer (64 + 32 bytes = 768 bits each). */
-__kernel void pbkdf2_sha256_rounds(__global uint* state, const uint n, const uint rounds){
-    uint gid = get_global_id(0);
-    if(gid >= n) return;
-    __global uint* s = state + (ulong)gid * 32;
-    uint ist[8], ost[8], u[8], t[8], w[16], st[8];
-    for(int i=0;i<8;i++){ ist[i] = s[i]; ost[i] = s[8+i]; u[i] = s[16+i]; t[i] = s[24+i]; }
-    for(uint r=0;r<rounds;r++){
-        for(int i=0;i<8;i++) w[i] = u[i];
-        w[8] = 0x80000000;
-        for(int i=9;i<15;i++) w[i] = 0;
-        w[15] = 768;
-        for(int i=0;i<8;i++) st[i] = ist[i];
-        sha256_block(st, w);
-        for(int i=0;i<8;i++) w[i] = st[i];
-        for(int i=0;i<8;i++) st[i] = ost[i];
-        sha256_block(st, w);
-        for(int i=0;i<8;i++){ u[i] = st[i]; t[i] ^= st[i]; }
-    }
-    for(int i=0;i<8;i++){ s[16+i] = u[i]; s[24+i] = t[i]; }
-}
 '''
+
+def _sha256_32_source():
+    """OpenCL C for the PBKDF2 round loop's one hot function: a SHA-256
+    compression from a saved state over a block that is 32 bytes of message
+    (8 words) plus the fixed padding of a 96-byte message (the 64-byte HMAC
+    pad is already in the state). The padding words are compile-time
+    constants, the message schedule is a rolling 16-word window instead of a
+    64-word array, and all 64 rounds are written out, so everything stays in
+    registers and the compiler folds the constant part of the schedule. The
+    unrolled rounds are generated here rather than typed out."""
+    k = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+         0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+         0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+         0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+         0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+         0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+         0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+    out = [
+        '#define R32(x,n) rotate((uint)(x), (uint)(32 - (n)))',
+        '#define BS0(x) (R32(x,2) ^ R32(x,13) ^ R32(x,22))',
+        '#define BS1(x) (R32(x,6) ^ R32(x,11) ^ R32(x,25))',
+        '#define SS0(x) (R32(x,7) ^ R32(x,18) ^ ((x) >> 3))',
+        '#define SS1(x) (R32(x,17) ^ R32(x,19) ^ ((x) >> 10))',
+        '#define CH(e,f,g) bitselect((g), (f), (e))',
+        '#define MAJ(a,b,c) bitselect((a), (b), ((c) ^ (a)))',
+        '#define RND(a,b,c,d,e,f,g,h,w,k) { uint t1_ = (h) + BS1(e) + CH(e,f,g) + (k) + (w); (d) += t1_; (h) = t1_ + BS0(a) + MAJ(a,b,c); }',
+        '',
+        '/* SHA-256 compression of st over m[0..7] followed by the fixed padding',
+        '   of a 96-byte message: 0x80000000, six zero words, the length 768. */',
+        'inline void sha256_c32(const uint* st, const uint* m, uint* out){',
+        '    uint a=st[0], b=st[1], c=st[2], d=st[3], e=st[4], f=st[5], g=st[6], h=st[7];',
+        '    uint w0=m[0], w1=m[1], w2=m[2], w3=m[3], w4=m[4], w5=m[5], w6=m[6], w7=m[7];',
+        '    uint w8=0x80000000u, w9=0u, w10=0u, w11=0u, w12=0u, w13=0u, w14=0u, w15=768u;',
+    ]
+    names = 'abcdefgh'
+    for i in range(64):
+        r = i % 8
+        v = names[8 - r:] + names[:8 - r] if r else names
+        if i >= 16:
+            out.append('    w%d += SS1(w%d) + w%d + SS0(w%d);' % (i % 16, (i - 2) % 16, (i - 7) % 16, (i - 15) % 16))
+        out.append('    RND(%s, w%d, 0x%08xu)' % (','.join(v), i % 16, k[i]))
+    out += [
+        '    out[0]=st[0]+a; out[1]=st[1]+b; out[2]=st[2]+c; out[3]=st[3]+d;',
+        '    out[4]=st[4]+e; out[5]=st[5]+f; out[6]=st[6]+g; out[7]=st[7]+h;',
+        '}',
+        '',
+        '/* Runs `rounds` further PBKDF2 rounds. Each one is HMAC over the 32-byte',
+        '   previous U, which with the pads already hashed is one block for the',
+        '   inner hash and one for the outer (64 + 32 bytes = 768 bits each). */',
+        '__kernel void pbkdf2_sha256_rounds(__global uint* state, const uint n, const uint rounds){',
+        '    uint gid = get_global_id(0);',
+        '    if(gid >= n) return;',
+        '    __global uint* s = state + (ulong)gid * 32;',
+        '    uint ist[8], ost[8], u[8], t[8], x[8];',
+        '    for(int i=0;i<8;i++){ ist[i] = s[i]; ost[i] = s[8+i]; u[i] = s[16+i]; t[i] = s[24+i]; }',
+        '    for(uint r=0;r<rounds;r++){',
+        '        sha256_c32(ist, u, x);',
+        '        sha256_c32(ost, x, u);',
+        '        for(int i=0;i<8;i++) t[i] ^= u[i];',
+        '    }',
+        '    for(int i=0;i<8;i++){ s[16+i] = u[i]; s[24+i] = t[i]; }',
+        '}',
+        '',
+    ]
+    return '\n'.join(out)
 
 # How long one rounds launch aims to take. Short enough to stay well clear
 # of a display watchdog (about 2 seconds on Windows), long enough that the
 # launch overhead does not count.
 GPU_KDF_LAUNCH_SECS = 0.25
+
+class _GpuCancelled(Exception):
+    pass
 
 class GpuPBKDF2(object):
     """Batch PBKDF2-HMAC-SHA256 on an OpenCL device, for the GCM files."""
@@ -3603,7 +4446,7 @@ class GpuPBKDF2(object):
             raise RuntimeError('no OpenCL GPU device found (NVIDIA or AMD drivers and an ICD must be installed)')
         self.device = devices[0]
         self.name = self.device.name
-        self.s = CLSession(self.cl, self.device, _GPU_PBKDF2_KERNEL)
+        self.s = CLSession(self.cl, self.device, _GPU_PBKDF2_KERNEL + _sha256_32_source())
         units = max(1, int(self.device.compute_units))
         if self.device.type & _CL_DEVICE_TYPE_GPU:
             self.batch = units * 256
@@ -3611,20 +4454,24 @@ class GpuPBKDF2(object):
             self.batch = units * 4
         self._rounds = 256
 
-    def derive(self, passwords, salts, iters=GCM_KDF_ITERS):
+    def derive(self, passwords, salts, iters=GCM_KDF_ITERS, should_cancel=None):
         """32-byte PBKDF2-HMAC-SHA256 of each password (bytes) with the salt
-        at the same index; salts may also be a single salt for them all."""
+        at the same index; salts may also be a single salt for them all.
+        should_cancel() is checked between launches; when it turns true the
+        derivation is abandoned with _GpuCancelled."""
         if isinstance(salts, (bytes, bytearray)):
             salts = [bytes(salts)] * len(passwords)
         if len(salts) != len(passwords):
             raise ValueError('one salt per password')
         out = []
         for i in range(0, len(passwords), self.batch):
-            out.extend(self._derive_batch(passwords[i:i + self.batch], salts[i:i + self.batch], iters))
+            out.extend(self._derive_batch(passwords[i:i + self.batch], salts[i:i + self.batch], iters, should_cancel))
         return out
 
-    def derive_keys(self, key_strings, salts, iters=GCM_KDF_ITERS):
-        return self.derive([_gcm_password(k) for k in key_strings], salts, iters)
+    def derive_keys(self, key_strings, salts, iters=GCM_KDF_ITERS, should_cancel=None):
+        if should_cancel is None:
+            return self.derive([_gcm_password(k) for k in key_strings], salts, iters)
+        return self.derive([_gcm_password(k) for k in key_strings], salts, iters, should_cancel=should_cancel)
 
     @staticmethod
     def _packed(items):
@@ -3635,7 +4482,7 @@ class GpuPBKDF2(object):
             pos += len(b)
         return (b''.join((bytes(b) for b in items)), _u32(off), _u32(ln))
 
-    def _derive_batch(self, passwords, salts, iters):
+    def _derive_batch(self, passwords, salts, iters, should_cancel=None):
         n = len(passwords)
         if n == 0:
             return []
@@ -3648,6 +4495,8 @@ class GpuPBKDF2(object):
             s.run('pbkdf2_sha256_init', n, *bufs + [state, _cl_u32(n)])
             left = iters - 1
             while left > 0:
+                if should_cancel is not None and should_cancel():
+                    raise _GpuCancelled()
                 rounds = min(left, self._rounds)
                 t0 = time.time()
                 s.run('pbkdf2_sha256_rounds', n, state, _cl_u32(n), _cl_u32(rounds))
@@ -3913,6 +4762,7 @@ def run_once(argv):
     if args.seen_cap:
         globals()['SEEN_CAP'] = max(1000, args.seen_cap)
     explicit_brute = args.brute
+    explicit_dumb = args.dumb_brute
     full_auto = not args.src and (not args.auto) and (not args.file_list)
     if full_auto:
         args.auto = True
@@ -4052,7 +4902,10 @@ def run_once(argv):
             gcm_gpu = init_gpu_gcm(quiet=args.quiet)
         gpu_active = gpu is not None
         gate_at = 5 * 10 ** 11 if gpu_active else 50000000
-        gate_rate = 300000000.0 if gpu_active else 150000.0 if BACKEND != 'pure-python' else 2000.0
+        # Guesses a second, for the time the gate quotes. Since 5.2 a CPU core
+        # checks about 100,000 a second, and the candidate generator in the
+        # main process caps the whole machine somewhere past a million.
+        gate_rate = 300000000.0 if gpu_active else min(100000.0 * workers, 1500000.0) if BACKEND != 'pure-python' else 2000.0
         interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)())
 
         def gate(name, tier_idx):
@@ -4078,6 +4931,52 @@ def run_once(argv):
             except EOFError:
                 return False
             return ans in ('y', 'yes')
+        def gcm_gate(name, tier_idx):
+            # The open-ended methods on the newer files, where a guess is a
+            # 600,000-round key stretch. A structural length that would take
+            # longer than GCM_GATE_SECS is asked about in the same words as
+            # the older files' gate (the window answers those prompts). The
+            # fitted model never ends there, so under the full-auto default
+            # it is asked about too; asked for by name (--brute), it runs.
+            rate = gcm_rate(gcm_gpu, workers)
+            if name == 'fitted model':
+                if explicit_brute or args.yes:
+                    return True
+                print()
+                print('The files from the newer attack are still locked. Each guess on them takes')
+                print('about %s here. The next method tries likely keys modelled on this' % _fmt_rate(rate))
+                print('crew and keeps going until you stop it (progress is saved with --checkpoint).')
+                if not interactive:
+                    print('This is not a terminal, so I am stopping here. Run again with --brute or')
+                    print('--yes to run it.')
+                    return False
+                try:
+                    ans = input('Keep going with the newer files? [y/N] ').strip().lower()
+                except EOFError:
+                    return False
+                return ans in ('y', 'yes')
+            if not name.startswith('structural brute len='):
+                return True
+            length = int(name.rsplit('=', 1)[1])
+            size = dumb_alpha_n ** length
+            secs = size / rate
+            if secs <= GCM_GATE_SECS or args.yes:
+                return True
+            print()
+            print('On the newer files, every key shorter than %d characters has been tried with no match.' % length)
+            print("The next step, keys of exactly %d characters, is %s possibilities. At this" % (length, '{:,}'.format(size)))
+            print("machine's speed that is roughly %s, and each step after it is far longer." % _fmt_long(secs))
+            if not interactive:
+                print('This is not a terminal, so I am stopping here. Run again with --yes to keep')
+                print('going, --max-candidates N to put a limit on it, or --checkpoint FILE so it')
+                print('can be resumed.')
+                return False
+            try:
+                ans = input('Keep going into %d-character keys? [y/N] ' % length).strip().lower()
+            except EOFError:
+                return False
+            return ans in ('y', 'yes')
+        gcm_ckpt = gcm_checkpoint_path(args.checkpoint)
         if not args.quiet:
             STATUS.say('Methods I will try, in order:')
             for i, label in enumerate(summarize_methods([n for n, _ in plan]), 1):
@@ -4116,7 +5015,12 @@ def run_once(argv):
         # Full-auto turns --brute on by itself. There, once a key has opened
         # files, the slow variant tier is not run for the stragglers, so a
         # double-click run gets to writing in minutes rather than an hour.
-        gcm_later = None if explicit_brute else [(n, f) for n, f in plan if n != 'recovered key variants']
+        # The GCM files get the bounded methods first (gcm_plan), and the
+        # open-ended ones (fitted model, structural brute) last, after the
+        # older files, since a guess there costs a full key stretch.
+        gcm_plan = [(n, f) for n, f in plan if n in GCM_TIERS]
+        gcm_open = [(n, f) for n, f in plan if n not in GCM_TIERS]
+        gcm_later = None if explicit_brute else [(n, f) for n, f in gcm_plan if n != 'recovered key variants']
         interrupted = False
 
         def covered_now():
@@ -4135,16 +5039,17 @@ def run_once(argv):
             if gcm_only:
                 if not args.quiet:
                     STATUS.say('%s file(s) come from a newer, slower version of the attack. Each key' % fmt_count(len(gcm_only)))
-                    STATUS.say('test takes about a second on these, so only the quick methods are used on them.')
+                    STATUS.say('test takes far longer on these, so the quick methods run on them first and')
+                    STATUS.say('any slower ones last, after everything else.')
                     STATUS.tech('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
                     STATUS.tech('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
-                    STATUS.tech('stretch on these, so they get the supplied, recovered and variant keys;')
-                    STATUS.tech('the fitted model and structural brute are left to the older files.')
+                    STATUS.tech('stretch on these, so they get the supplied, recovered and variant keys')
+                    STATUS.tech('first; the fitted model and structural brute run on them at the end.')
                     if gcm_gpu is not None:
                         STATUS.tech('The key stretch runs on the GPU (%s); the CPU checks every' % gcm_gpu.name)
                         STATUS.tech('derived key against the full GCM tag.')
                     STATUS.say()
-                gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
+                gmap, gtried, _ = find_all_gcm_keys(gcm_only, gcm_plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu, checkpoint=gcm_ckpt)
                 tried += gtried
                 merge(gmap, 'gcm')
                 aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
@@ -4160,7 +5065,7 @@ def run_once(argv):
                     STATUS.tech('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
             ecb_keys = []
             quick_plan = [(n, f) for n, f in plan if n in QUICK_TIERS]
-            late_gcm_plan = plan
+            late_gcm_plan = gcm_plan
             if ecb_cand and len(quick_plan) < len(plan) and (budget_left() is None or budget_left() > 0):
                 # Before any open-ended search, the quick tiers in both
                 # formats. One GCM file in sixteen is block-aligned, and
@@ -4175,14 +5080,14 @@ def run_once(argv):
                 if aligned_closed and (budget_left() is None or budget_left() > 0):
                     if not args.quiet:
                         STATUS.tech('  checking %d block-aligned file(s) as AES-GCM before any brute force:' % len(aligned_closed))
-                    gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
+                    gmap, gtried, _ = find_all_gcm_keys(aligned_closed, quick_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu, checkpoint=gcm_ckpt)
                     tried += gtried
                     merge(gmap, 'gcm')
                 done = covered_now()
                 ecb_cand = [f for f in ecb_cand if f not in done]
                 # Every block-aligned file left has had the quick tiers as
                 # GCM already, so only the rest of the plan remains for them.
-                late_gcm_plan = [(n, f) for n, f in plan if n not in QUICK_TIERS]
+                late_gcm_plan = [(n, f) for n, f in gcm_plan if n not in QUICK_TIERS]
             if ecb_cand and (budget_left() is None or budget_left() > 0):
                 emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key, on_part=lambda part: merge(part, 'ecb'))
                 tried += etried
@@ -4204,7 +5109,29 @@ def run_once(argv):
                 if not args.quiet:
                     STATUS.tech()
                     STATUS.tech('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
-                gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu)
+                gmap, gtried, _ = find_all_gcm_keys(leftover, late_gcm_plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, later_plan=gcm_later, gpu=gcm_gpu, checkpoint=gcm_ckpt)
+                tried += gtried
+                merge(gmap, 'gcm')
+            # Last, the open-ended methods on every file still closed that
+            # can be GCM, as the older files had them: the fitted model and
+            # the structural brute, gated and resumable the same way. Under
+            # the full-auto default they only run when nothing has opened
+            # yet, so files already matched are written without waiting.
+            done = covered_now()
+            still_gcm = [f for f in files if gcm_shaped(sizes[f]) and not ecb_shaped(sizes[f]) and f not in done]
+            # Block-aligned files join only when this machine shows the newer
+            # attack at all (a file that cannot be ECB, or one opened as GCM);
+            # otherwise they are older-format files whose key is not found,
+            # and the slow GCM search would only spend hours on them.
+            if still_gcm or any(v == 'gcm' for v in file_scheme.values()):
+                still_gcm += [f for f in files if ecb_shaped(sizes[f]) and gcm_shaped(sizes[f]) and f not in done]
+            if gcm_open and still_gcm and (explicit_brute or explicit_dumb or not mapping) and (budget_left() is None or budget_left() > 0) and not STATUS.gate_declined:
+                if not args.quiet:
+                    STATUS.say()
+                    STATUS.say('Trying the slower methods on the %s file(s) from the newer attack that are' % fmt_count(len(still_gcm)))
+                    STATUS.say('still locked. Each guess takes about %s here.' % _fmt_rate(gcm_rate(gcm_gpu, workers)))
+                    STATUS.tech('AES-GCM, open-ended methods: %s' % ', '.join(summarize_methods([n for n, _ in gcm_open])))
+                gmap, gtried, _ = find_all_gcm_keys(still_gcm, gcm_open, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, on_part=lambda part: merge(part, 'gcm'), probed=probed, gpu=gcm_gpu, checkpoint=gcm_ckpt, on_tier_start=gcm_gate)
                 tried += gtried
                 merge(gmap, 'gcm')
         except SearchAbort:

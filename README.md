@@ -544,13 +544,25 @@ file       = salt | iv | ciphertext | tag
 
 The typed key is still the only secret, so the recovered keys still work.
 What changes is the cost of a guess: 600,000 PBKDF2 rounds per file, roughly
-0.2 seconds per CPU core, instead of one AES block. So on GCM files unmicro
-tries the supplied keys, wordlist, recovered operator keys, scavenged strings
-and (under `--brute`) the recovered key variants, and leaves the fitted model
-and the structural brute to the older files, where they finish in a sensible
-time. With `--gpu` the key stretch for those guesses runs on the GPU (see
+0.1 to 0.4 seconds per CPU core, instead of one AES block. So on GCM files
+unmicro first tries the bounded methods: the supplied keys, wordlist,
+recovered operator keys, scavenged strings and (under `--brute`) the
+recovered key variants. Since 5.2 the GCM files then get every method the
+older files get: once everything else is done, the fitted model (`--brute`)
+and the structural brute (`--dumb-brute`) run on the GCM files still locked,
+with `--checkpoint` resume and the same "keep going?" question before a
+length that would take more than half an hour at the measured speed. Under
+the full-auto default those slow methods only run on the GCM files when no
+key has opened anything yet, and the fitted model asks first, since on these
+files it never runs out. With `--gpu` the key stretch runs on the GPU (see
 [GPU acceleration](#gpu-acceleration-optional-experimental)), which is
 over a hundred times faster per card than per CPU core.
+
+A key is tested on a GCM file by its tag alone: GHASH over the ciphertext and
+one AES block, with no keystream and no plaintext, which is a third of the
+work of decrypting the file (a sixth with pycryptodome). Each back end's
+tag-only check is compared with full decryption when it starts, and falls
+back to full decryption if they ever disagree.
 
 Because a GCM guess is so expensive, each one is checked against two files at
 a time, and a key that opens one of them is then tried on every other file.
@@ -569,6 +581,11 @@ their own. In full-auto (no options, or a double-click) that second sweep
 skips the slow recovered key variants, so the files already opened are
 written in minutes rather than after an hour. Run with `--brute` explicitly
 to include the variants for the stragglers.
+
+`--checkpoint FILE` covers the GCM sweeps too, in `FILE.gcm` next to it. One
+run makes several GCM sweeps over different sets of files (the quick methods
+first, the open-ended ones last), and each keeps its own place in that file,
+so resuming one never discards another.
 
 Telling the formats apart: a GCM file is the original length plus 44 bytes, so
 it is a whole number of AES blocks only one time in sixteen, while an ECB file
@@ -613,6 +630,14 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Faster, and the GCM files get every method (5.2).** The GCM key test
+  checks the tag alone (a third of the work), and with `--gpu` the GPU
+  derives the next batch of keys while the CPU checks the last one, so on a
+  12-core machine the CPU no longer holds the card back. The GCM files now get
+  the fitted model and the structural brute, with `--checkpoint` resume and
+  the length gate. The older files' CPU sweep is four to six times faster per
+  core, and their GPU kernels were rewritten (about 20 times faster on pocl). Same
+  answers throughout: every change is checked against the code it replaced.
 - **The GPU from the downloads (5.1.1).** `--gpu` and the window's "Use the
   graphics card" now work in the downloads, using the OpenCL that comes with
   the NVIDIA or AMD graphics driver. Nothing else to install.
@@ -717,8 +742,16 @@ OpenCL library although the driver is installed, install the OpenCL loader
 (`ocl-icd-libopencl1` on Debian and Ubuntu, `ocl-icd` on Fedora), or point
 `UNMICRO_OPENCL_LIB` at the library.
 
-The fitted-model tier stays on the CPU (its candidates come from Python logic
-that does not map to a GPU); the big win is the structural brute.
+The fitted-model tier's candidates still come from the CPU (Python logic
+that does not map to a GPU); the GPU checks them, on a helper thread while the
+next batch is generated, and the big win is the structural brute.
+
+Since 5.2 the AES kernel works on 32-bit columns, keeps the S-boxes in each
+work-group's local memory, and does InvMixColumns with a few shifts and XORs
+instead of sixteen bit-by-bit field multiplications a round; the word-list
+kernel tries every probe block in one launch. On pocl the structural brute
+went from about 190,000 to 3.6 million guesses a second; the gain on a real
+card has not been measured yet (`tests/bench_speed.py --gpu` measures it).
 
 ### The newer (GCM) files
 
@@ -728,16 +761,24 @@ PBKDF2-HMAC-SHA256 with the file's own salt, then one tag check. Since 5.1,
 batch of guesses at once (thousands on a desktop card), the rounds split over
 short launches so a display driver's watchdog is never tripped. The same
 kernel derives the keys when a found key is tried across every file. On an
-RTX 3060 that is about 1,300 guesses a second; a CPU core does about 9.
+RTX 3060 that was about 1,300 guesses a second with 5.1; a CPU core does
+about 9. Since 5.2 the round loop compresses with a SHA-256 written for its
+one block shape: the padding words are constants, the message schedule is a
+16-word window, and the 64 rounds are written out, so it all stays in
+registers. That has not been measured on a card yet; `tests/bench_speed.py
+--gpu` prints the rate.
 
 The GPU only derives keys. The CPU still checks every derived key against the
 file's full 128-bit GCM tag, across all cores, exactly as it does for its own,
 so a wrong key from the GPU can only fail to open a file, never open it
-wrongly. The probe files are large (10 MB or more where there are any), so on
-a fast card those tag checks, not the GPU, can set the pace: 20,000 guesses
-against 11-20 MB probes took 178 seconds with an RTX 3060 and 997 on 12 CPU
-threads alone. A pause or Stop is answered between waves of tag checks, and
-the guesses not yet fully checked are tried again first, so none is skipped. Before the GPU is
+wrongly. The probe files are large (10 MB or more where there are any), so in
+5.1 those tag checks, not the GPU, set the pace on a fast card: 20,000
+guesses against 11-20 MB probes took 178 seconds with an RTX 3060 and 997 on
+12 CPU threads alone. Since 5.2 the checks are tag-only (2.7 times as many a
+second per core on such probes) and run while the GPU derives the next
+batch, on a helper thread, so neither waits for the other. A pause or Stop
+is answered between waves of tag checks, and the guesses not yet fully
+checked are tried again, so none is skipped. Before the GPU is
 used for a single GCM guess, its output must equal `hashlib.pbkdf2_hmac` byte
 for byte, over passwords either side of the 64-byte HMAC block (longer ones
 are pre-hashed, as HMAC requires), non-ASCII keys, random salts, uneven
@@ -796,10 +837,10 @@ The engine's options, after `--cli` (or after `python3 unmicro.py`):
 | `--auto` | search every drive and user location for encrypted files |
 | `--brute` | sweep generated candidates when the recovered keys do not fit |
 | `--deep` | widen every family, including the layout walker. Hours, not seconds |
-| `--dumb-brute` | plain structural brute force, 1 character up to the longest key, over the Turkish+English alphabet. Asks before a length that would take too long |
+| `--dumb-brute` | plain structural brute force, 1 character up to the longest key, over the Turkish+English alphabet. Asks before a length that would take too long. Runs on the GCM files too, last |
 | `--charset observed\|turkish\|full` | alphabet for `--dumb-brute` (default `turkish`: Turkish and English lowercase and digits) |
 | `--scavenge FILE` | pull candidate keys out of an unencrypted dump (memory image, pagefile, strings listing) and try them first. Repeatable |
-| `--checkpoint FILE` | save sweep progress and resume from it, so an interrupted or capped run continues |
+| `--checkpoint FILE` | save sweep progress and resume from it, so an interrupted or capped run continues. The GCM sweeps keep theirs in `FILE.gcm` |
 | `--seen-cap N` | cap each generator's dedup set at N entries (default 1,000,000). Lower on a low-memory machine |
 | `--workers N` | parallel worker processes for the sweep. Defaults to every CPU core; set 1 to stay single-process |
 | `--gpu` | use an OpenCL GPU (NVIDIA or AMD) for the sweep: AES for the older files, the key stretch for the GCM files. Self-tests against the CPU first and falls back if it fails |
