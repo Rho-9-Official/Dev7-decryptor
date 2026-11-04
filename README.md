@@ -73,7 +73,10 @@ rotated at every release.
 
 **Getting a key.** If you are a victim of this crew, email
 **recon@rho-9.com** with the phrase **Chattering Magpies** and anything about
-where you were hit. Rho-9 sends a key back once your case is confirmed. There
+where you were hit. I need informstion, and cannot help you if you tell me nothing. 
+
+**Emails with no subject, or details will be ignored in favor of more informative reports.**
+Rho-9 sends a key back once your case is confirmed. There
 is no charge for the key. If you already have a key from a previous build, we
 will send you the new one with any update to your case, same channel.
 
